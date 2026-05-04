@@ -36,3 +36,7 @@ It is intended to keep documentation up to date alongside code changes.
 
 - Documentation is now required to remain current with code changes.
 - The change log is the authoritative record for problems and solutions.
+- Added ignored secrets support for SwitchBot MAC address in `device-secrets.properties`.
+- Added `device-secrets.example.properties` as a template file.
+- Updated `SwitchBotDoorController` to optionally use the configured SwitchBot MAC address if it is present.
+- Confirmed no MAC address-like values were found in current repository history.

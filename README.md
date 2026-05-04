@@ -99,6 +99,14 @@ See [docs/test-plan.md](docs/test-plan.md) for detailed test procedures and vali
 3. **IMPORTANT**: Enable device password in device settings
    - Go to device settings → Password
    - Set a strong password (this secures Bluetooth communication)
+4. Store your device MAC address in a local ignored file:
+   - Copy `device-secrets.example.properties` to `device-secrets.properties`
+   - Set `switchbot.mac.address=AA:BB:CC:DD:EE:FF`
+   - **Do not commit** `device-secrets.properties` to git.
+   - Create the file safely from the command line:
+     ```bash
+     cp device-secrets.example.properties device-secrets.properties
+     ```
 
 ### Security Note
 By default, SwitchBot devices accept unencrypted Bluetooth commands. **Always enable the device password** to prevent unauthorized access via replay attacks.
@@ -159,6 +167,7 @@ The app requires the following permissions:
 
 - Keep documentation aligned with code changes.
 - Record key problems and solutions in `docs/change-log.md`.
+- Store secret device information in `device-secrets.properties`, which is ignored by git.
 - Update the README and docs whenever BLE or device behavior changes.
 
 ## Security Considerations

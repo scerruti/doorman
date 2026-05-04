@@ -1,0 +1,35 @@
+classDiagram
+    class GarageDoorInterface {
+        +openDoor(): Result<Unit>
+        +closeDoor(): Result<Unit>
+        +getStatus(): Result<DoorStatus>
+    }
+
+    class SwitchBotDoor {
+        #deviceId: String
+        #password: String?
+        +authenticate(): Result<Unit>
+    }
+
+    class BluetoothSwitchBotDoor {
+        -bleManager: BluetoothManager
+        +scanForDevice(): Result<Device>
+        +sendCommand(command: ByteArray): Result<Unit>
+    }
+
+    class HttpSwitchBotDoor {
+        -apiClient: HttpClient
+        +sendRequest(endpoint: String, body: Any): Result<ApiResponse>
+    }
+
+    class MockGarageDoorController {
+        -currentState: DoorStatus
+        +openDoor(): Result<Unit>
+        +closeDoor(): Result<Unit>
+        +getStatus(): Result<DoorStatus>
+    }
+
+    GarageDoorInterface <|.. SwitchBotDoor
+    SwitchBotDoor <|-- BluetoothSwitchBotDoor
+    SwitchBotDoor <|-- HttpSwitchBotDoor
+    GarageDoorInterface <|.. MockGarageDoorController

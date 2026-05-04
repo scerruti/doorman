@@ -1,0 +1,15 @@
+sequenceDiagram
+    participant User
+    participant App
+    participant Geofence
+    participant Bluetooth
+    participant SwitchBot
+
+    User->>App: Approaches home
+    App->>Geofence: Check location
+    Geofence-->>App: Entered boundary
+    App->>Bluetooth: Start scan
+    Bluetooth-->>App: Device found
+    App->>SwitchBot: Authenticate + send open command
+    SwitchBot-->>App: Command accepted
+    App-->>User: Prompt open door available

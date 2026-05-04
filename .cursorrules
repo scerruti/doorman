@@ -1,0 +1,87 @@
+# Copilot Instructions for AAOS Smart Garage Door Controller
+
+## Project Overview
+This project builds a location-aware garage door opener app for Android Automotive OS (AAOS) and Android phones, with a Mac desktop app for testing the SwitchBot Bluetooth interface. The app uses geofencing to detect when approaching home and prompts to open/close the garage door via SwitchBot hardware.
+
+## Key Technologies
+- **Language**: Kotlin (Multiplatform for shared code)
+- **Platforms**: Android (AAOS + Phone), macOS (testing)
+- **UI Framework**: Jetpack Compose (Android), Compose Multiplatform (shared UI)
+- **Bluetooth**: BLE for direct SwitchBot control
+- **Location**: Android Geofencing API
+- **Architecture**: Clean Architecture with separation of concerns
+
+## Code Structure Guidelines
+- Use Kotlin Multiplatform for shared business logic and data models
+- Define interfaces in `shared` module for platform-specific implementations
+- Follow Clean Architecture: Domain, Data, Presentation layers
+- Use dependency injection (Koin for multiplatform)
+- Implement repository pattern for data access
+- Use sealed classes for state management
+- Write unit tests for all business logic
+- Use integration tests for platform-specific code
+
+## Naming Conventions
+- Classes: PascalCase
+- Functions/Methods: camelCase
+- Variables/Properties: camelCase
+- Constants: UPPER_SNAKE_CASE
+- Files: PascalCase.kt
+
+## Security Considerations
+- Always use encrypted Bluetooth communication with SwitchBot password
+- Store sensitive data securely (EncryptedSharedPreferences on Android)
+- Implement proper permission handling
+- Validate all inputs and handle edge cases
+
+## Testing Strategy
+- Unit tests for shared logic
+- Integration tests for Bluetooth communication
+- UI tests using Compose testing
+- Mock implementations for testing without hardware
+
+## Development Workflow
+1. Start with Mac app for Bluetooth testing
+2. Implement mock garage door controller first
+3. Add real SwitchBot Bluetooth implementation
+4. Port to Android with AAOS-specific features
+5. Add geofencing and notifications
+
+## Bluetooth Implementation Notes
+- Use BLE Central mode to scan and connect to SwitchBot
+- Implement proper scanning with filters for MAC address
+- Handle connection timeouts and reconnections
+- Generate secure commands with password + timestamp hash
+- Test thoroughly on Mac before Android deployment
+
+## Android-Specific Guidelines
+- Use Android Car App Library for AAOS compatibility
+- Implement high-priority notifications for geofence triggers
+- Handle background execution properly
+- Request necessary permissions (BLUETOOTH_SCAN, BLUETOOTH_CONNECT, ACCESS_FINE_LOCATION)
+- Use WorkManager for background tasks
+
+## macOS-Specific Guidelines
+- Use Compose Multiplatform for desktop UI
+- Implement Bluetooth via Kotlin/Native or JVM library
+- Focus on testing SwitchBot communication logic
+- Use as development/testing platform before Android
+
+## Error Handling
+- Use Result<T> or sealed classes for operation results
+- Log errors appropriately (Timber on Android)
+- Provide user-friendly error messages
+- Handle Bluetooth state changes gracefully
+
+## Performance Considerations
+- Minimize Bluetooth scanning time
+- Cache device information when possible
+- Use efficient data structures
+- Profile on both platforms regularly
+
+## Documentation
+- Keep code well-commented
+- Update README with setup instructions
+- Document API contracts clearly
+- Maintain changelog for releases</content>
+<parameter name="filePath">/Users/scerruti/doorman/.cursorrules
