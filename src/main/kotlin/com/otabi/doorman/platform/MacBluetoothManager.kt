@@ -14,7 +14,7 @@ import kotlinx.serialization.json.jsonPrimitive
 // Requires Python 3 and bleak installed: pip install bleak
 class MacBluetoothManager : BluetoothManager {
 
-    private val pythonScript = File("src/main/resources/switchbot_ble.py").absolutePath
+    private val pythonScript =  this::class.java.classLoader.getResource("opener_ble.py")!!.path
 
     override suspend fun discoverDevices(): Result<List<BluetoothDevice>> {
         return withContext(Dispatchers.IO) {

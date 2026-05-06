@@ -9,3 +9,5 @@ build/
 out/
 .DS_Store
 device-secrets.properties
+src/main/resources/sim_devices.json
+src/main/resources/real_devices.json
