@@ -53,7 +53,7 @@ class OpenerClient:
         If callback is None, decoded notifications are printed.
         """
 
-        def handler(data: bytes):
+        def handler_OLD(data: bytes):
             decoded = decode_notify(data)
             self.last_notify = decoded
 
@@ -61,6 +61,26 @@ class OpenerClient:
                 callback(decoded)
             else:
                 print("NOTIFY:", decoded, flush=True)
+
+        def handler(payload: bytes, crypto=None):
+            # Basic raw info
+            print("NOTIFY RAW len:", len(payload), "hex:", payload.hex())
+
+            # Try to decode as UTF-8 JSON (some simulators send JSON)
+            try:
+                s = payload.decode('utf-8')
+                print("NOTIFY as UTF-8:", s)
+            except Exception:
+                pass
+
+            # If you have a crypto/decrypt helper, try it
+            if crypto is not None:
+                try:
+                    decoded = crypto.decrypt(payload)  # adjust to your API
+                    print("DECRYPTED:", decoded)
+                except Exception as e:
+                    print("DECRYPT failed:", repr(e))
+
 
         await self.backend.register_notification_handler(
             self.address,

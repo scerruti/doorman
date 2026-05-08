@@ -199,7 +199,6 @@ class FakeBleBackend:
             return
 
         # Forward encrypted bytes to the simulated device
-        self.tick()
         device.write(data)
         self.save_state()
 
