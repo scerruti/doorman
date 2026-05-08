@@ -16,6 +16,10 @@ import java.io.DataOutputStream
 import java.net.Socket
 import java.nio.ByteBuffer
 import kotlin.system.exitProcess
+import com.otabi.doorman.platform.parseScanRecordFromAdvHex
+import com.otabi.doorman.platform.macFromScanRecordLike
+import com.otabi.doorman.MacExtractionConfig
+import com.otabi.doorman.MacExtractionMode
 
 // Daemon socket
 private const val DAEMON_HOST = "127.0.0.1"
@@ -23,15 +27,9 @@ private const val DAEMON_PORT = 9000
 private const val NOTIFY_UUID = "0000ffe1-0000-1000-8000-00805f9b34fb"
 
 // Configure target identification
-// If you know the exact MAC you can set TARGET_ADDR; otherwise we resolve from discovery.
 private val TARGET_ADDR: String? = null
-
-// Preferred: identify SwitchBot devices by their primary Service UUID, then fingerprint by manufacturer data.
 private const val SWITCHBOT_UUID: String = "c706248c-302a-431a-9669-e77c669d2f2d"
-// Manufacturer signature (hex substring) to look for inside advHex; set to your device's manufacturer prefix.
-private val TARGET_MANUFACTURER_HEX: String? = "0969" // example prefix; replace with real signature (lowercase hex)
-// Legacy fallback: optional name substring to match if service+manufacturer resolution fails.
-// Recommended: keep null in production; use only for quick local testing.
+private val TARGET_MANUFACTURER_HEX: String? = "0969"
 private val TARGET_NAME_SUBSTRING: String? = null
 
 // Gate / registry tuning
@@ -157,12 +155,18 @@ private fun runDiscoveryListener(registry: DiscoveryRegistry, gate: RssiRangeGat
                 if (mtype == 0x07) { // NOTIFY
                     val d = parseDiscoveryPayload(payload)
                     if (d != null) {
-                        // debug: show advHex and extracted MAC for troubleshooting
-                        val extractedMac = extractMacFromAdvHex(d.advHex)
-                        println("DISCOVERY parsed: addr=${d.address} name=${d.name} rssi=${d.rssi} adv=${d.advHex} extractedMac=$extractedMac")
+                        // prefer byte-level parsing via platform extractor
+                        val finalMac = try {
+                            extractMacFromAdvHexPlatform(d.advHex, companyId = 0x0969, macOffsetInManuf = 0)
+                        } catch (e: Exception) {
+                            println("MAC extraction failed for adv=${d.advHex}: ${e.message}")
+                            null
+                        }
 
-                        // update registry and gate
-                        registry.upsert(Discovery(d.address, d.rssi, d.name, d.advHex))
+                        println("DISCOVERY parsed addr=${d.address} name=${d.name} rssi=${d.rssi} adv=${d.advHex} mac=$finalMac mode=${MacExtractionConfig.mode}")
+
+                        // update registry and gate (single update, include mac if available)
+                        registry.upsert(Discovery(d.address, d.rssi, d.name, d.advHex, finalMac))
                         gate.recordRssi(d.address, d.rssi)
                     }
                 }
@@ -184,7 +188,6 @@ private suspend fun resolveTargetAddressSuspend(
     if (!explicitAddr.isNullOrBlank()) return explicitAddr
 
     // 1) Service UUID -> Manufacturer data (preferred)
-    // Snapshot: find any discovery that advertises the SwitchBot service and contains manufacturer MAC
     findMacFromServiceAndManufacturerSnapshot(registry, SWITCHBOT_UUID, manufacturerHex)?.let { return it }
 
     // Wait for next matching emission: filter by service UUID then map to extracted MAC from advHex
@@ -194,10 +197,9 @@ private suspend fun resolveTargetAddressSuspend(
         registry.discoveryFlow
             .filter { it.advHex.contains(serviceUuidCompact, ignoreCase = true) == true }
             .mapNotNull { adv ->
-                // only accept if manufacturer signature present (if provided) and MAC can be extracted
                 val advHex = adv.advHex
                 if (!sig.isNullOrBlank() && (advHex.contains(sig, ignoreCase = true) != true)) return@mapNotNull null
-                extractMacFromAdvHex(advHex)
+                extractMacFromAdvHexPlatform(advHex)
             }
             .first()
     } ?: run {
@@ -216,31 +218,77 @@ private suspend fun resolveTargetAddressSuspend(
     }
 }
 
+/**
+ * Convert canonical UUID (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx) to BLE little-endian compact hex.
+ * Returns a 32-char lowercase hex string suitable for substring checks against advHex.
+ */
+fun canonicalToBleLeCompact(uuid: String): String {
+    val clean = uuid.replace("-", "")
+    if (clean.length != 32) return clean.lowercase()
+
+    // first three fields are little-endian by byte-pairs
+    val timeLow = clean.substring(0, 8).chunked(2).reversed().joinToString("") { it }
+    val timeMid = clean.substring(8, 12).chunked(2).reversed().joinToString("") { it }
+    val timeHi  = clean.substring(12, 16).chunked(2).reversed().joinToString("") { it }
+    val rest    = clean.substring(16, 32)
+
+    return (timeLow + timeMid + timeHi + rest).lowercase()
+}
+
 /** Snapshot helper: find a discovery that advertises the service UUID and yields a MAC from manufacturer data. */
-private fun findMacFromServiceAndManufacturerSnapshot(registry: DiscoveryRegistry, serviceUuid: String, manufacturerHex: String?): String? {
-    val compact = serviceUuid.replace("-", "").lowercase()
+private fun findMacFromServiceAndManufacturerSnapshot(
+    registry: DiscoveryRegistry,
+    serviceUuid: String,
+    manufacturerHex: String?
+): String? {
+    println("TRACE findMacFromServiceAndManufacturerSnapshot called; registry.size=${registry.all().size}")
     val sig = manufacturerHex?.lowercase()
+    val canonicalSvc = serviceUuid.lowercase()
+
     return registry.all().asSequence()
-        .filter { it.advHex.lowercase().contains(compact) == true }
-        .mapNotNull { adv ->
-            val advHex = adv.advHex
-            if (!sig.isNullOrBlank() && (advHex.contains(sig, ignoreCase = true) != true)) return@mapNotNull null
-            extractMacFromAdvHex(advHex)
+        .mapNotNull { rec ->
+            val advHex = rec.advHex.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+
+            // Parse advHex into ScanRecordLike
+            val scan = try {
+                parseScanRecordFromAdvHex(advHex)
+            } catch (e: Exception) {
+                println("PARSE ERROR adv=$advHex err=${e.message}")
+                null
+            }
+
+            // Log discovered service UUIDs
+            val svcList = scan?.serviceUuids ?: emptyList()
+            if (svcList.isNotEmpty()) {
+                println("DEBUG found serviceUuids=${svcList.joinToString(", ")} for adv=${advHex.take(48)}")
+            } else {
+                // also log compact/ble-le presence for quick inspection
+                val bleLe = canonicalToBleLeCompact(serviceUuid)
+                println("DEBUG no serviceUuids parsed; adv contains canonical=${advHex.contains(canonicalSvc, true)} bleLe=${advHex.contains(bleLe, true)}")
+            }
+
+            // Log manufacturer data keys and sample bytes
+            if (scan?.manufacturerData?.isNotEmpty() == true) {
+                scan.manufacturerData.forEach { (cid, bytes) ->
+                    println("DEBUG manuf 0x%04X -> %s".format(cid, bytes.joinToString(" ") { "%02x".format(it) }))
+                }
+            } else {
+                println("DEBUG: manufacturerData map is empty for adv=${advHex.take(48)}")
+            }
+
+            // Determine if this record matches service UUID or manufacturer signature
+            val svcOk = scan?.serviceUuids?.any { it.equals(serviceUuid, ignoreCase = true) } == true
+            val manOk = sig?.let { advHex.contains(it, ignoreCase = true) } ?: false
+
+            if (!svcOk && !manOk) return@mapNotNull null
+
+            // Prefer stored mac if present, else extract from advHex
+            rec.mac ?: extractMacFromAdvHexPlatform(advHex)
         }
         .firstOrNull()
 }
 
-/** Try to extract a 6-byte MAC from advHex. Returns formatted MAC or null. */
-private fun extractMacFromAdvHex(advHex: String?): String? {
-    if (advHex.isNullOrBlank()) return null
-    // Normalize: keep only hex chars
-    val hex = advHex.filter { it.isLetterOrDigit() }.lowercase()
-    // Find first contiguous 12-hex-digit sequence (6 bytes)
-    val match = Regex("([0-9a-f]{12})").find(hex) ?: return null
-    val raw = match.groupValues[1]
-    // Format as AA:BB:CC:DD:EE:FF
-    return raw.chunked(2).joinToString(":") { it.uppercase() }
-}
+
 
 /** Suspend-friendly wait for gate stability. */
 suspend fun waitForStableInRangeSuspend(
@@ -254,11 +302,9 @@ suspend fun waitForStableInRangeSuspend(
         while (!gate.isStableInRange(deviceAddr, thresholdRssi)) {
             delay(pollIntervalMs)
         }
-        // This is the block's last expression and is a Boolean
         true
     } ?: false
 }
-
 
 /** Read a length-prefixed message from DataInputStream. Returns null on EOF. */
 private fun readLengthPrefixedMessage(input: DataInputStream): ByteArray? {
@@ -301,4 +347,33 @@ private fun parseDiscoveryPayload(payload: ByteArray): DiscoveryPayload? {
     val name = parts.getOrNull(2)?.takeIf { it.isNotEmpty() }
     val advHex = parts.getOrNull(3)?.trim() ?: ""
     return DiscoveryPayload(addr, rssi, name, advHex)
+}
+
+/** Minimal platform-only extractor */
+fun extractMacFromAdvHexPlatform(advHex: String, companyId: Int = 0x0969, macOffsetInManuf: Int = 0): String? {
+    // println("DEBUG advHex=${advHex}")
+
+    val scan = try { parseScanRecordFromAdvHex(advHex) } catch (e: Exception) {
+        // println("DEBUG parseScanRecordFromAdvHex threw: ${e.message}")
+        null
+    }
+
+    if (scan == null) {
+        // println("DEBUG: parseScanRecordFromAdvHex returned null for adv=${advHex}")
+    } else {
+        // manufacturerData is a Map<Int, ByteArray>
+        if (scan.manufacturerData.isEmpty()) {
+            // println("DEBUG: manufacturerData map is empty")
+        } else {
+            // println("DEBUG manufacturer keys: ${scan.manufacturerData.keys.joinToString(", ") { "0x%04X".format(it) }}")
+            // scan.manufacturerData.forEach { (companyId, bytes) ->
+                // println("DEBUG manuf 0x%04X -> ${bytes.joinToString(" ") { "%02x".format(it) }}".format(companyId))
+            // }
+        }
+    }
+
+    val manuf = scan?.getManufacturerSpecificData(companyId) ?: return null
+    if (manuf.size < macOffsetInManuf + 6) return null
+    val macBytes = manuf.copyOfRange(macOffsetInManuf, macOffsetInManuf + 6)
+    return macBytes.joinToString(":") { String.format("%02X", it) }
 }

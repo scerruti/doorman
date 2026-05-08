@@ -3,8 +3,10 @@ package com.otabi.doorman.platform
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import java.util.concurrent.ConcurrentHashMap
+import com.otabi.doorman.platform.parseScanRecordFromAdvHex
+import com.otabi.doorman.platform.macFromScanRecordLike
 
-data class Discovery(val address: String, val rssi: Int, val name: String?, val advHex: String, val tsMs: Long = System.currentTimeMillis())
+data class Discovery(val address: String, val rssi: Int, val name: String?, val advHex: String, val mac: String? = null, val tsMs: Long = System.currentTimeMillis())
 
 class DiscoveryRegistry {
   private val map = ConcurrentHashMap<String, Discovery>()
@@ -26,3 +28,4 @@ class DiscoveryRegistry {
   fun all(): List<Discovery> = map.values.toList()
   fun pruneOlderThan(ageMs: Long) { val cutoff = System.currentTimeMillis() - ageMs; map.entries.removeIf { it.value.tsMs < cutoff } }
 }
+

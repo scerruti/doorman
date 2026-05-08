@@ -17,6 +17,8 @@ import struct
 import logging
 import time
 import random
+import re
+import uuid
 from typing import Set, Tuple, List, Dict, Optional
 from aiohttp import web
 
@@ -139,10 +141,11 @@ class DeviceState:
 device = DeviceState()
 
 # --- Simulator device list (modifiable via admin endpoints) ------------------
-# Each entry: { "address": str, "name": str, "base_rssi": int, "adv": bytes, "jitter": int }
+# Each entry: { "address": str, "name": str, "base_rssi": int, "adv": str (hex), "jitter": int }
+# Store adv as a hex string (service uuid compact + manufacturer prefix + 12-hex MAC + optional extra)
 SIMULATED_DEVICES: List[Dict] = [
-    {"address": "SIM:AA:BB:CC:01", "name": "SimLock1", "base_rssi": -74, "adv": b"", "jitter": 2},
-    {"address": "SIM:AA:BB:CC:02", "name": "SimLock2", "base_rssi": -80, "adv": b"", "jitter": 2},
+    {"address": "SIM:AA:BB:CC:01", "name": "SimLock1", "base_rssi": -74, "adv": "", "jitter": 2},
+    {"address": "SIM:AA:BB:CC:02", "name": "SimLock2", "base_rssi": -80, "adv": "", "jitter": 2},
 ]
 # TODO: Consider moving SIMULATED_DEVICES into a class with thread-safe access if modified concurrently.
 # TODO: Consider exposing per-device spike behavior and schedules via admin API.
@@ -150,15 +153,10 @@ SIMULATED_DEVICES: List[Dict] = [
 # Deterministic RNG for simulator (optional)
 _sim_rng = random.Random(SIMULATOR_RNG_SEED)
 
-import re
-import uuid
-from typing import Optional, Set
-
 MAC_RE = re.compile(r'^[0-9a-f]{12}$', re.IGNORECASE)
 
 def make_locally_administered_mac() -> str:
     """Return a 12-hex-digit MAC string with the locally-administered bit set."""
-    import random
     b = [random.getrandbits(8) for _ in range(6)]
     b[0] = (b[0] & 0b11111100) | 0b00000010
     return ''.join(f'{x:02x}' for x in b)
@@ -188,13 +186,57 @@ def is_host_mac(candidate_hex: Optional[str]) -> bool:
         return False
     return candidate_hex.lower() in host_mac_set()
 
+def uuid_to_ble_le(uuid_str: str) -> bytes:
+    """
+    Convert canonical UUID string to BLE little-endian 16-byte representation.
+    Example: "c706248c-302a-431a-9669-e77c669d2f2d"
+    """
+    u = uuid_str.replace("-", "")
+    if len(u) != 32:
+        # fallback: try to parse via uuid.UUID
+        try:
+            uu = uuid.UUID(uuid_str)
+            u = uu.hex
+        except Exception:
+            return b""
+    # parts: time_low(8 hex), time_mid(4), time_hi(4), rest(16)
+    time_low = bytes.fromhex(u[0:8])[::-1]
+    time_mid = bytes.fromhex(u[8:12])[::-1]
+    time_hi = bytes.fromhex(u[12:16])[::-1]
+    rest = bytes.fromhex(u[16:32])
+    return time_low + time_mid + time_hi + rest
+
 def build_adv_hex_from_components(service_uuid: str, manufacturer_prefix: str, mac_no_colons: Optional[str], extra_hex: str = "") -> str:
-    compact = service_uuid.replace("-", "").lower()
-    man = (manufacturer_prefix or "").lower()
+    # Normalize inputs
+    svc = (service_uuid or "c706248c-302a-431a-9669-e77c669d2f2d")
+    man = (manufacturer_prefix or "0969").lower()
     mac = normalize_mac_hex(mac_no_colons) if mac_no_colons else None
     if mac is None or is_host_mac(mac):
         mac = make_locally_administered_mac()
-    return compact + man + mac + (extra_hex.lower() if extra_hex else "")
+
+    # Build BLE LTV fields:
+    # 1) 128-bit Service UUID field (type 0x07). Value is 16 bytes in BLE little-endian layout.
+    uuid_le = uuid_to_ble_le(svc)
+    svc_field = bytes([1 + len(uuid_le), 0x07]) + uuid_le if uuid_le else b""
+
+    # 2) Manufacturer Specific Data field (type 0xFF)
+    # company id must be two bytes little-endian; manufacturer_prefix may be provided as hex string
+    try:
+        cid = int(man, 16)
+    except Exception:
+        try:
+            cid = int(man)
+        except Exception:
+            cid = 0x0969
+    cid_le = cid.to_bytes(2, "little")
+    manuf_payload = cid_le + bytes.fromhex(mac)
+    manuf_field = bytes([1 + len(manuf_payload), 0xFF]) + manuf_payload
+
+    # Optional extra hex appended after the standard fields (treated as raw bytes)
+    extra = bytes.fromhex(extra_hex) if extra_hex else b""
+
+    adv = svc_field + manuf_field + extra
+    return adv.hex()
 
 def mask_mac_for_log(mac12: Optional[str]) -> str:
     if not mac12 or len(mac12) != 12:
@@ -323,7 +365,8 @@ def _build_sim_discovery_payload(entry: Dict, rssi: int) -> bytes:
     addr_b = entry["address"].encode("utf-8")
     name_b = entry.get("name", "").encode("utf-8")
     rssi_b = str(rssi).encode("utf-8")
-    adv_hex_b = (entry.get("adv", b"").hex()).encode("utf-8")
+    # adv is stored as a hex string (not bytes) to avoid accidental host MAC bytes
+    adv_hex_b = entry.get("adv", "").encode("utf-8")
     return b"|".join([addr_b, rssi_b, name_b, adv_hex_b])
 
 async def simulator_discovery_task(period_s: float = SIMULATOR_DISCOVERY_PERIOD_S):
@@ -347,6 +390,10 @@ async def simulator_discovery_task(period_s: float = SIMULATOR_DISCOVERY_PERIOD_
                 jitter = d.get("jitter", 2)
                 rssi = d.get("base_rssi", -80) + _sim_rng.randint(-jitter, jitter)
                 payload = _build_sim_discovery_payload(d, rssi)
+                # Mask any MAC in logs to avoid leaking host or device MACs
+                m = re.search(r'([0-9a-fA-F]{12})', d.get("adv", ""))
+                masked = mask_mac_for_log(m.group(1)) if m else ""
+                logger.debug("Simulator emitting discovery addr=%s name=%s masked_mac=%s rssi=%s", d.get("address"), d.get("name"), masked, rssi)
                 await broadcast_notify(payload)
             await asyncio.sleep(period_s)
     except asyncio.CancelledError:
@@ -409,18 +456,44 @@ async def admin_set_sim_devices(request):
     period = data.get("period_s")
     seed = data.get("rng_seed")
     if devs is not None:
-        # Basic validation and normalization
+        # Basic validation, normalization, and safety checks
         new_list = []
         for d in devs:
             addr = d.get("address")
             if not addr:
                 continue
+            name = d.get("name", "")
+            base_rssi = int(d.get("base_rssi", -80))
+            jitter = int(d.get("jitter", 2))
+
+            # Admin may supply adv as a hex string. If provided, validate and ensure it does not embed a host MAC.
+            adv_raw = d.get("adv", "")
+            adv_clean = ""
+            if adv_raw:
+                # normalize to lowercase string
+                adv_candidate = str(adv_raw).lower()
+                # try to find a 12-hex MAC inside adv; if found and it matches host, replace it
+                found = re.search(r'([0-9a-fA-F]{12})', adv_candidate)
+                if found:
+                    mac_candidate = found.group(1).lower()
+                    if is_host_mac(mac_candidate):
+                        logger.warning("Admin-supplied adv contained a host MAC; replacing with synthetic MAC")
+                        mac_candidate = make_locally_administered_mac()
+                        adv_candidate = adv_candidate.replace(found.group(1), mac_candidate, 1)
+                    adv_clean = adv_candidate
+                else:
+                    # no 12-hex run found; treat adv_raw as extra hex and build adv from components
+                    adv_clean = build_adv_hex_from_components(d.get("service_uuid", "c706248c-302a-431a-9669-e77c669d2f2d"), d.get("manufacturer", "0969"), d.get("mac"), extra_hex=str(adv_raw))
+            else:
+                # no adv provided: build adv from components or generate safe mac
+                adv_clean = build_adv_hex_from_components(d.get("service_uuid", "c706248c-302a-431a-9669-e77c669d2f2d"), d.get("manufacturer", "0969"), d.get("mac"))
+
             new_list.append({
                 "address": addr,
-                "name": d.get("name", ""),
-                "base_rssi": int(d.get("base_rssi", -80)),
-                "adv": bytes.fromhex(d.get("adv", "")) if d.get("adv") else b"",
-                "jitter": int(d.get("jitter", 2))
+                "name": name,
+                "base_rssi": base_rssi,
+                "adv": adv_clean,
+                "jitter": jitter
             })
         global SIMULATED_DEVICES
         SIMULATED_DEVICES = new_list
