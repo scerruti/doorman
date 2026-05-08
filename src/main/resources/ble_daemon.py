@@ -4,37 +4,106 @@ ble_daemon.py
 
 Persistent BLE daemon with a TCP socket BLE façade and built-in simulator mode.
 
-Protocol (length-prefixed):
-  [4-byte BE length][1-byte msg_type][payload...]
+This is a drop-in replacement that:
+ - Adds a simulator discovery task that periodically broadcasts synthetic discovery frames.
+ - Adds deterministic emit_once helpers for unit tests.
+ - Adds admin HTTP endpoints to inspect and control simulated devices and cadence.
+ - Adds TODO markers for further improvements (deterministic RNG, payload compatibility, API purity).
 
-Message types:
-  0x01 CONNECT        Client -> Daemon (payload: UTF-8 selector)
-  0x02 CONNECT_RSP    Daemon -> Client (0x00=OK|0x01=ERR + macOS-UUID UTF-8 if OK)
-  0x03 SUBSCRIBE      Client -> Daemon (payload: notify characteristic UUID UTF-8)
-  0x04 SUBSCRIBE_RSP  Daemon -> Client (0x00=OK|0x01=ERR)
-  0x05 WRITE_REQ      Client -> Daemon (1 byte writeType + raw bytes)
-  0x06 WRITE_RSP      Daemon -> Client (raw ACK bytes, e.g., 02 00 00 00)
-  0x07 NOTIFY         Daemon -> Client (raw notification bytes)
-  0x08 DISCONNECT     Client -> Daemon (no payload)
-  0xFF ERROR          Either direction (1 byte code + UTF-8 message)
-
-Simulator behavior (default):
-  - On WRITE_REQ: immediately return WRITE_RSP (02 00 00 00).
-  - If payload starts with 0x57, schedule NOTIFY OPENING after PROCESSING_DELAY,
-    then NOTIFY OPEN after MOTOR_RUN_TIME.
-Admin HTTP:
-  - POST /admin/set  { state, processing_delay, motor_run_time }
-  - GET  /admin/log  returns recent writes
+Keep existing protocol and simulator WRITE_REQ behavior unchanged.
 """
 import asyncio
 import struct
 import logging
 import time
-from typing import Set, Tuple
+import random
+from typing import Set, Tuple, List, Dict, Optional
 from aiohttp import web
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ble_daemon")
+
+# Requires: pip install bleak
+try:
+    from bleak import BleakScanner
+    _BLEAK_AVAILABLE = True
+except Exception:
+    _BLEAK_AVAILABLE = False
+
+# Robust helper to get RSSI from available places
+def _get_rssi(device, advertisement_data):
+    try:
+        return int(getattr(device, "rssi"))
+    except Exception:
+        pass
+    try:
+        return int(getattr(advertisement_data, "rssi"))
+    except Exception:
+        pass
+    try:
+        return int(device.metadata.get("rssi"))
+    except Exception:
+        pass
+    return 0
+
+# Robust manufacturer data -> bytes (flatten to hex)
+def _flatten_manufacturer_data(advertisement_data):
+    try:
+        mdata = getattr(advertisement_data, "manufacturer_data", {}) or {}
+        parts = []
+        for k, v in mdata.items():
+            if isinstance(v, (bytes, bytearray)):
+                parts.append(bytes(v))
+            elif isinstance(v, int):
+                parts.append(bytes([v]))
+            elif isinstance(v, (list, tuple)):
+                parts.append(bytes(v))
+            else:
+                parts.append(str(v).encode("utf-8"))
+        return b"".join(parts)
+    except Exception:
+        return b""
+
+# Build discovery payload (safe)
+def build_discovery_frame(device, advertisement_data) -> bytes:
+    addr = (device.address or "").encode("utf-8")
+    name = (device.name or "").encode("utf-8")
+    rssi_val = _get_rssi(device, advertisement_data)
+    rssi_bytes = str(rssi_val).encode("utf-8")
+    adv = _flatten_manufacturer_data(advertisement_data)
+    payload = b"|".join([addr, rssi_bytes, name, adv.hex().encode("utf-8")])
+    return payload
+
+# Bleak discovery task (use the robust build_discovery_frame)
+async def bleak_discovery_task():
+    if not _BLEAK_AVAILABLE:
+        logger.warning("Bleak not available; discovery disabled")
+        return
+
+    async def detection_callback(device, advertisement_data):
+        try:
+            rssi_val = _get_rssi(device, advertisement_data)
+            logger.info("Bleak discovered: %s name=%s rssi=%s", device.address, device.name, rssi_val)
+            payload = build_discovery_frame(device, advertisement_data)
+            await broadcast_notify(payload)
+        except Exception:
+            logger.exception("Error in detection_callback")
+
+    scanner = BleakScanner(detection_callback)
+    try:
+        await scanner.start()
+        logger.info("Bleak scanner started")
+        while True:
+            await asyncio.sleep(60)
+    except asyncio.CancelledError:
+        try:
+            await scanner.stop()
+        except Exception:
+            pass
+        raise
+    except Exception:
+        logger.exception("Bleak scanner failed")
+
 
 # Configuration (defaults)
 TCP_HOST = "127.0.0.1"
@@ -45,6 +114,10 @@ ADMIN_HTTP_PORT = 9001
 SIMULATOR = True  # default; run with --no-sim to enable real BLE (TODO)
 PROCESSING_DELAY = 0.12  # seconds between ACK and first NOTIFY
 MOTOR_RUN_TIME = 1.5     # seconds from OPENING -> OPEN
+
+# Simulator discovery configuration (new)
+SIMULATOR_DISCOVERY_PERIOD_S = 0.2  # seconds between discovery broadcasts
+SIMULATOR_RNG_SEED: Optional[int] = None  # TODO: set a seed for deterministic tests if desired
 
 # Example status frame template (toy example). Replace with real frames if available.
 STATUS_FRAME = bytes.fromhex("570f31000000050100020000010000e3")
@@ -60,11 +133,74 @@ class DeviceState:
 
     def record_write(self, raw: bytes):
         self.log.append({"ts": time.time(), "hex": raw.hex()})
-        # keep log bounded
         if len(self.log) > 1000:
             self.log = self.log[-1000:]
 
 device = DeviceState()
+
+# --- Simulator device list (modifiable via admin endpoints) ------------------
+# Each entry: { "address": str, "name": str, "base_rssi": int, "adv": bytes, "jitter": int }
+SIMULATED_DEVICES: List[Dict] = [
+    {"address": "SIM:AA:BB:CC:01", "name": "SimLock1", "base_rssi": -74, "adv": b"", "jitter": 2},
+    {"address": "SIM:AA:BB:CC:02", "name": "SimLock2", "base_rssi": -80, "adv": b"", "jitter": 2},
+]
+# TODO: Consider moving SIMULATED_DEVICES into a class with thread-safe access if modified concurrently.
+# TODO: Consider exposing per-device spike behavior and schedules via admin API.
+
+# Deterministic RNG for simulator (optional)
+_sim_rng = random.Random(SIMULATOR_RNG_SEED)
+
+import re
+import uuid
+from typing import Optional, Set
+
+MAC_RE = re.compile(r'^[0-9a-f]{12}$', re.IGNORECASE)
+
+def make_locally_administered_mac() -> str:
+    """Return a 12-hex-digit MAC string with the locally-administered bit set."""
+    import random
+    b = [random.getrandbits(8) for _ in range(6)]
+    b[0] = (b[0] & 0b11111100) | 0b00000010
+    return ''.join(f'{x:02x}' for x in b)
+
+def normalize_mac_hex(s: Optional[str]) -> Optional[str]:
+    """Normalize MAC-like input to 12 hex digits (no separators). Return None if invalid."""
+    if not s:
+        return None
+    cleaned = re.sub(r'[^0-9a-fA-F]', '', s).lower()
+    return cleaned if MAC_RE.match(cleaned) else None
+
+def host_mac_set() -> Set[str]:
+    """Best-effort set of host MACs (12-hex lowercase). Uses uuid.getnode() fallback."""
+    macs = set()
+    try:
+        node = uuid.getnode()
+        # uuid.getnode may return a random value; include only if it looks like a MAC
+        candidate = f'{node:012x}'
+        if MAC_RE.match(candidate):
+            macs.add(candidate.lower())
+    except Exception:
+        pass
+    return macs
+
+def is_host_mac(candidate_hex: Optional[str]) -> bool:
+    if not candidate_hex:
+        return False
+    return candidate_hex.lower() in host_mac_set()
+
+def build_adv_hex_from_components(service_uuid: str, manufacturer_prefix: str, mac_no_colons: Optional[str], extra_hex: str = "") -> str:
+    compact = service_uuid.replace("-", "").lower()
+    man = (manufacturer_prefix or "").lower()
+    mac = normalize_mac_hex(mac_no_colons) if mac_no_colons else None
+    if mac is None or is_host_mac(mac):
+        mac = make_locally_administered_mac()
+    return compact + man + mac + (extra_hex.lower() if extra_hex else "")
+
+def mask_mac_for_log(mac12: Optional[str]) -> str:
+    if not mac12 or len(mac12) != 12:
+        return mac12 or ""
+    parts = [mac12[i:i+2].upper() for i in range(0, 12, 2)]
+    return "***:***:" + ":".join(parts[3:6])
 
 # Framing helpers
 def pack_msg(mtype: int, payload: bytes = b"") -> bytes:
@@ -107,7 +243,6 @@ async def route_message(mtype: int, payload: bytes, reader: asyncio.StreamReader
     if mtype == 0x01:  # CONNECT
         selector = payload.decode("utf-8", errors="ignore")
         logger.info("CONNECT selector=%s", selector)
-        # In simulator, return a fake macOS UUID; in real mode, daemon would resolve actual UUID
         mac_uuid = "SIM-DEVICE-UUID-0001"
         writer.write(pack_msg(0x02, bytes([0x00]) + mac_uuid.encode()))
         await writer.drain()
@@ -128,11 +263,9 @@ async def route_message(mtype: int, payload: bytes, reader: asyncio.StreamReader
         raw = payload[1:]
         logger.info("WRITE_REQ type=%d raw=%s", write_type, raw.hex())
         device.record_write(raw)
-        # Immediate ATT write response (4-byte example)
         ack = bytes.fromhex("02000000")
         writer.write(pack_msg(0x06, ack))
         await writer.drain()
-        # Simulator behavior: if payload looks like SwitchBot frame (starts with 0x57), schedule notifies
         valid = raw.startswith(b'\x57')
         if SIMULATOR and valid:
             asyncio.create_task(simulator_process_write(raw))
@@ -157,7 +290,6 @@ async def simulator_process_write(raw: bytes):
     opening_frame = build_status_frame("OPENING")
     await asyncio.sleep(PROCESSING_DELAY)
     await broadcast_notify(opening_frame)
-    # simulate motor run
     await asyncio.sleep(MOTOR_RUN_TIME)
     device.state = "OPEN"
     device.event_counter += 1
@@ -165,10 +297,7 @@ async def simulator_process_write(raw: bytes):
     await broadcast_notify(open_frame)
 
 def build_status_frame(state: str) -> bytes:
-    # Simple deterministic modification of STATUS_FRAME for tests.
-    # Real implementation should construct according to SwitchBot spec.
     base = bytearray(STATUS_FRAME)
-    # encode state in second-to-last byte as a toy example
     if state == "OPENING":
         base[-2] = 0x01
     elif state == "OPEN":
@@ -187,6 +316,58 @@ async def broadcast_notify(payload: bytes):
             await w.drain()
         except Exception:
             device.subscribers.discard((w, char))
+
+# --- New: simulator discovery task and helpers --------------------------------
+
+def _build_sim_discovery_payload(entry: Dict, rssi: int) -> bytes:
+    addr_b = entry["address"].encode("utf-8")
+    name_b = entry.get("name", "").encode("utf-8")
+    rssi_b = str(rssi).encode("utf-8")
+    adv_hex_b = (entry.get("adv", b"").hex()).encode("utf-8")
+    return b"|".join([addr_b, rssi_b, name_b, adv_hex_b])
+
+async def simulator_discovery_task(period_s: float = SIMULATOR_DISCOVERY_PERIOD_S):
+    """
+    Periodically broadcast synthetic discovery frames for configured simulated devices.
+
+    TODOs:
+      - Make RNG seedable via SIMULATOR_RNG_SEED for deterministic tests.
+      - Add per-device spike schedules and configurable scenarios via admin API.
+      - Consider emitting real advertisement_data structure or matching exact payload
+        expected by Main.kt (payload compatibility).
+      - Optionally provide an emit_once API for unit tests that inject timestamps.
+    """
+    logger.info("Simulator discovery task started (period_s=%s)", period_s)
+    try:
+        while True:
+            # snapshot devices to avoid mutation races
+            devices_snapshot = list(SIMULATED_DEVICES)
+            for d in devices_snapshot:
+                # small jitter around base RSSI
+                jitter = d.get("jitter", 2)
+                rssi = d.get("base_rssi", -80) + _sim_rng.randint(-jitter, jitter)
+                payload = _build_sim_discovery_payload(d, rssi)
+                await broadcast_notify(payload)
+            await asyncio.sleep(period_s)
+    except asyncio.CancelledError:
+        logger.info("Simulator discovery task cancelled")
+        raise
+    except Exception:
+        logger.exception("Simulator discovery task error")
+
+def simulator_emit_once(entry: Dict, rssi: Optional[int] = None, ts: Optional[float] = None):
+    """
+    Synchronous helper for unit tests: build a single discovery payload and return it.
+    Does not perform network I/O. Tests can call broadcast_notify with the returned payload.
+    TODO: Consider adding a gate.record_rssi(...) bridge that accepts injected timestamps.
+    """
+    if rssi is None:
+        jitter = entry.get("jitter", 2)
+        rssi = entry.get("base_rssi", -80) + _sim_rng.randint(-jitter, jitter)
+    payload = _build_sim_discovery_payload(entry, rssi)
+    return payload
+
+# ------------------------------------------------------------------------------
 
 # Admin HTTP handlers
 async def admin_set_state(request):
@@ -210,6 +391,48 @@ async def admin_get_log(request):
 async def admin_health(request):
     return web.json_response({"ok": True, "simulator": SIMULATOR, "state": device.state})
 
+# New admin endpoints for simulator control
+async def admin_get_sim_devices(request):
+    # Return a copy to avoid exposing internal structures for mutation
+    return web.json_response({"devices": [
+        {"address": d["address"], "name": d.get("name"), "base_rssi": d.get("base_rssi"), "jitter": d.get("jitter")}
+        for d in SIMULATED_DEVICES
+    ], "period_s": SIMULATOR_DISCOVERY_PERIOD_S})
+
+async def admin_set_sim_devices(request):
+    """
+    Accepts JSON: { devices: [{address, name, base_rssi, jitter, adv}], period_s: float, rng_seed: int }
+    Replaces the SIMULATED_DEVICES list atomically.
+    """
+    data = await request.json()
+    devs = data.get("devices")
+    period = data.get("period_s")
+    seed = data.get("rng_seed")
+    if devs is not None:
+        # Basic validation and normalization
+        new_list = []
+        for d in devs:
+            addr = d.get("address")
+            if not addr:
+                continue
+            new_list.append({
+                "address": addr,
+                "name": d.get("name", ""),
+                "base_rssi": int(d.get("base_rssi", -80)),
+                "adv": bytes.fromhex(d.get("adv", "")) if d.get("adv") else b"",
+                "jitter": int(d.get("jitter", 2))
+            })
+        global SIMULATED_DEVICES
+        SIMULATED_DEVICES = new_list
+    if period is not None:
+        global SIMULATOR_DISCOVERY_PERIOD_S
+        SIMULATOR_DISCOVERY_PERIOD_S = float(period)
+    if seed is not None:
+        global SIMULATOR_RNG_SEED, _sim_rng
+        SIMULATOR_RNG_SEED = int(seed)
+        _sim_rng = random.Random(SIMULATOR_RNG_SEED)
+    return web.json_response({"ok": True, "devices": SIMULATED_DEVICES, "period_s": SIMULATOR_DISCOVERY_PERIOD_S, "rng_seed": SIMULATOR_RNG_SEED})
+
 # Entrypoint: start TCP server and admin HTTP
 async def start_servers():
     server = await asyncio.start_server(handle_client, TCP_HOST, TCP_PORT)
@@ -220,6 +443,9 @@ async def start_servers():
         web.post("/admin/set", admin_set_state),
         web.get("/admin/log", admin_get_log),
         web.get("/admin/health", admin_health),
+        # simulator admin endpoints
+        web.get("/admin/sim/devices", admin_get_sim_devices),
+        web.post("/admin/sim/devices", admin_set_sim_devices),
     ])
     runner = web.AppRunner(app)
     await runner.setup()
@@ -227,12 +453,21 @@ async def start_servers():
     await site.start()
     logger.info("Admin HTTP listening on %s:%d", ADMIN_HTTP_HOST, ADMIN_HTTP_PORT)
 
+    # Start Bleak scanner when not in simulator mode; otherwise start simulator discovery
+    if SIMULATOR:
+        # start simulator discovery so clients receive discovery frames
+        asyncio.create_task(simulator_discovery_task(period_s=SIMULATOR_DISCOVERY_PERIOD_S))
+    else:
+        if _BLEAK_AVAILABLE:
+            asyncio.create_task(bleak_discovery_task())
+        else:
+            logger.warning("Started with --no-sim but bleak is not installed; install bleak to enable discovery")
+
     async with server:
         await server.serve_forever()
 
 def main():
-    # Declare globals before using them in argparse defaults to avoid SyntaxError
-    global SIMULATOR, TCP_HOST, TCP_PORT, ADMIN_HTTP_PORT
+    global SIMULATOR, TCP_HOST, TCP_PORT, ADMIN_HTTP_PORT, SIMULATOR_RNG_SEED
 
     import argparse
     parser = argparse.ArgumentParser(description="BLE daemon with socket façade and simulator")
@@ -240,6 +475,7 @@ def main():
     parser.add_argument("--host", default=TCP_HOST, help="TCP host")
     parser.add_argument("--port", type=int, default=TCP_PORT, help="TCP port")
     parser.add_argument("--admin-port", type=int, default=ADMIN_HTTP_PORT, help="Admin HTTP port")
+    parser.add_argument("--sim-seed", type=int, default=None, help="Optional RNG seed for simulator determinism")
     args = parser.parse_args()
 
     if args.no_sim:
@@ -247,6 +483,10 @@ def main():
     TCP_HOST = args.host
     TCP_PORT = args.port
     ADMIN_HTTP_PORT = args.admin_port
+    if args.sim_seed is not None:
+        SIMULATOR_RNG_SEED = args.sim_seed
+        global _sim_rng
+        _sim_rng = random.Random(SIMULATOR_RNG_SEED)
 
     logger.info("Starting ble_daemon (simulator=%s) on %s:%d (admin %d)", SIMULATOR, TCP_HOST, TCP_PORT, ADMIN_HTTP_PORT)
     try:
