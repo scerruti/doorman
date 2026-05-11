@@ -146,12 +146,7 @@ private fun runDiscoveryListener(registry: DiscoveryRegistry, gate: RssiRangeGat
             val input = DataInputStream(socket.getInputStream())
             val output = DataOutputStream(socket.getOutputStream())
 
-            // CONNECT
-            output.write(packMsg(0x01, "WoSwitchGDO".toByteArray(Charsets.UTF_8)))
-            output.flush()
-            readLengthPrefixedMessage(input) // CONNECT_RSP
-
-            // SUBSCRIBE
+            // SUBSCRIBE (to keep the connection alive/tested)
             output.write(packMsg(0x03, NOTIFY_UUID.toByteArray(Charsets.UTF_8)))
             output.flush()
             readLengthPrefixedMessage(input) // SUBSCRIBE_RSP
