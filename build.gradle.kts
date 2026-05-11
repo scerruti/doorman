@@ -23,9 +23,13 @@ kotlin {
 }
 
 application {
-    mainClass.set("com.otabi.doorman.MainKt")
+    mainClass.set("com.otabi.doorman.macos.MainKt")
 }
 
 tasks.test {
     useJUnitPlatform()
+}
+
+tasks.named<JavaExec>("run") {
+    standardInput = System.`in`
 }

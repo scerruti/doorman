@@ -6,9 +6,11 @@ build/
 .idea/
 .vscode/
 *.log
+*.log.last
 out/
 .DS_Store
 device-secrets.properties
+analyze_target.py
 src/main/resources/sim_devices.json
 src/main/resources/real_devices.json
 *.pyc

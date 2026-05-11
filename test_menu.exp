@@ -1,0 +1,41 @@
+#!/usr/bin/expect -f
+
+set timeout 30
+
+spawn ./gradlew run -q
+expect "Select option: "
+send "1\r"
+
+expect "Target resolved"
+expect "Select option: "
+send "2\r"
+
+expect "Device is stably in range"
+expect "Select option: "
+send "3\r"
+
+expect "Status: "
+expect "Select option: "
+send "4\r"
+
+expect "Door opened successfully"
+sleep 2
+
+expect "Select option: "
+send "3\r"
+
+expect "Status: "
+expect "Select option: "
+send "5\r"
+
+expect "Door closed successfully"
+sleep 2
+
+expect "Select option: "
+send "3\r"
+
+expect "Status: "
+expect "Select option: "
+send "7\r"
+
+expect eof
