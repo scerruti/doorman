@@ -15,3 +15,4 @@ src/main/resources/sim_devices.json
 src/main/resources/real_devices.json
 *.pyc
 src/main/resources/__pycache__/
+bin/
