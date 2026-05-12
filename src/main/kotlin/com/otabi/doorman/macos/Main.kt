@@ -156,10 +156,27 @@ private fun runDiscoveryListener(registry: DiscoveryRegistry, gate: RssiRangeGat
                 val mtype = msg[0].toInt() and 0xFF
                 val payload = msg.copyOfRange(1, msg.size)
                 if (mtype == 0x07) { // NOTIFY
-                    val d = parseDiscoveryPayload(payload)
-                    if (d != null) {
-                        registry.upsert(Discovery(d.address, d.rssi, d.name, d.advHex))
-                        gate.recordRssi(d.address, d.rssi)
+                    // Strip the Kotlin padding byte
+                    val actualData = if (payload.isNotEmpty() && payload[0] == 0x00.toByte()) payload.copyOfRange(1, payload.size) else payload
+                    
+                    if (actualData.size == 6) {
+                        // This is a SwitchBot status frame
+                        val stateCode = actualData[4].toInt() and 0xFF
+                        val stateStr = when (stateCode) {
+                            0x00 -> "CLOSED"
+                            0x01 -> "OPEN"
+                            0x02 -> "OPENING"
+                            0x03 -> "CLOSING"
+                            else -> "UNKNOWN ($stateCode)"
+                        }
+                        print("\n\n[Async Event] 🚪 Garage Door is now: $stateStr\nSelect option: ")
+                    } else {
+                        // This is a regular discovery payload
+                        val d = parseDiscoveryPayload(payload)
+                        if (d != null) {
+                            registry.upsert(Discovery(d.address, d.rssi, d.name, d.advHex))
+                            gate.recordRssi(d.address, d.rssi)
+                        }
                     }
                 }
             }

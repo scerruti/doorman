@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
 import time
@@ -40,7 +41,13 @@ class SimulatedDoor:
     # Duration (seconds) for OPENING/CLOSING transitions
     TRANSITION_DURATION = 3.0
 
-    def __init__(self, crypto=None, initial_state=None):
+    def __init__(self, address, name, rssi=-70, adv="0969aabbccddeeff", crypto=None, initial_state=None):
+        self.address = address
+        self.name = name
+        self.rssi = rssi
+        self.adv = adv
+        self._last_adv_time = 0
+
         self.crypto = None
         if initial_state:
             self._door = DoorState(
@@ -196,3 +203,26 @@ class SimulatedDoor:
 
     def get_state(self) -> str:
         return self._door.state
+
+    async def run_heartbeat(self, send_callback):
+        """
+        The internal engine of the door. 
+        Advances time and pushes notifications to the daemon.
+        """
+        print(f"SimulatedDoor ({self.name}): Engine started.", flush=True)
+        while True:
+            now = time.time()
+            self.tick(now)
+            
+            # 1. Periodic Discovery "Shout" (Every 5 seconds)
+            if now - self._last_adv_time >= 5.0:
+                discovery_str = f"{self.address}|{self.rssi}|{self.name}|{self.adv}"
+                # Send as a pipe-delimited string (Type 0x07)
+                send_callback(discovery_str.encode("utf-8"))
+                self._last_adv_time = now
+
+            # 2. State-Change Notifications (Transition/Complete/Status)
+            for payload in self.get_pending_notifications():
+                send_callback(payload)
+                
+            await asyncio.sleep(0.5)

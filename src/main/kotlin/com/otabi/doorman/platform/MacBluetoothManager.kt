@@ -6,6 +6,7 @@ import com.otabi.doorman.domain.BluetoothConnection
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * MacBluetoothManager
@@ -50,33 +51,25 @@ class MacBluetoothManager(
      */
     override suspend fun connect(device: BluetoothDevice): Result<BluetoothConnection> {
         return withContext(Dispatchers.IO) {
-            if (USE_SOCKET_DAEMON) {
-                try {
-                    socketClient = BleSocketClient(host, port)
-                    val ok = socketClient!!.connect(device.address)
-                    if (!ok) {
-                        connected.set(false)
-                        return@withContext Result.failure<BluetoothConnection>(Exception("Socket client failed to connect"))
-                    }
+            if (!USE_SOCKET_DAEMON) return@withContext Result.failure(Exception("Not implemented"))
 
-                    // Wire callbacks
-                    socketClient!!.onNotify = { payload -> notifyCallback?.invoke(payload) }
-                    socketClient!!.onWriteAck = { ack -> writeAckCallback?.invoke(ack) }
+            try {
+                // 1. Get or create the client
+                val client = socketClient ?: BleSocketClient(host, port).also { socketClient = it }
 
-                    connected.set(true)
+                // 2. Refresh wiring EVERY call to avoid the "Discovery Leak"
+                client.onNotify = { payload -> notifyCallback?.invoke(payload) }
+                client.onWriteAck = { ack -> writeAckCallback?.invoke(ack) }
 
-                    // TODO: construct and return a domain BluetoothConnection adapter here.
-                    // Example:
-                    // val conn = SocketBluetoothConnectionAdapter(socketClient!!)
-                    // return@withContext Result.success(conn)
-                    return@withContext Result.failure<BluetoothConnection>(Exception("Connected to socket daemon; BluetoothConnection adapter not implemented"))
-                } catch (ex: Exception) {
-                    connected.set(false)
-                    return@withContext Result.failure<BluetoothConnection>(ex)
+                // 3. Connect ONLY if the socket is actually dead
+                if (!client.isConnected) {
+                    val ok = client.connect(device.address)
+                    if (!ok) return@withContext Result.failure(Exception("Daemon unreachable"))
                 }
-            } else {
-                // TODO: Implement real macOS CoreBluetooth connection here and return a BluetoothConnection
-                return@withContext Result.failure<BluetoothConnection>(Exception("Real macOS BLE not implemented"))
+
+                Result.success(SocketConnectionAdapter(client))
+            } catch (ex: Exception) {
+                Result.failure(ex)
             }
         }
     }
@@ -87,44 +80,48 @@ class MacBluetoothManager(
                 val client = socketClient ?: BleSocketClient(host, port)
                 if (socketClient == null) socketClient = client
 
-                // Ensure connected to daemon
                 if (!connected.get()) {
                     client.connect(selector)
                     connected.set(true)
+                    wireCallbacks(client)
                 }
 
-                // This pulls the live scan results from the Python background task
-                val (mtype, payload) = client.sendDiscoveryRequest()
-                
-                if (mtype.toInt() != 0x08) {
-                    return@withContext Result.failure(Exception("Expected 0x08, got $mtype"))
-                }
-
-                val jsonString = String(payload, Charsets.UTF_8)
-                Result.success(parseDiscoveryJson(jsonString))
+                Result.success(discoveredDevices.values.toList())
             } catch (e: Exception) {
                 Result.failure(e)
             }
         }
     }
 
-    private fun parseDiscoveryJson(json: String): List<BluetoothDevice> {
-        // If you're using Gson or Kotlinx.Serialization, use that here.
-        // If not, a quick manual parse for address and name:
-        val devices = mutableListOf<BluetoothDevice>()
-        val regex = """\{"address":\s*"([^"]+)",\s*"name":\s*"([^"]*)",\s*"rssi":\s*(-?\d+),\s*"adv":\s*"([^"]*)"\}""".toRegex()
-        
-        regex.findAll(json).forEach { match ->
-            devices.add(BluetoothDevice(
-                address = match.groupValues[1],
-                name = match.groupValues[2].ifEmpty { null },
-                rssi = match.groupValues[3].toInt(),
-                advHex = match.groupValues[4]
-            ))
+    private fun wireCallbacks(client: BleSocketClient) {
+        client.onNotify = { payload -> 
+            handlePotentialDiscovery(payload)
+            notifyCallback?.invoke(payload) 
         }
-        return devices
+        client.onWriteAck = { ack -> writeAckCallback?.invoke(ack) }
+    }
+
+    private fun handlePotentialDiscovery(payload: ByteArray) {
+        val actualData = payload
+        try {
+            // A status frame is exactly 6 bytes, so anything longer is likely a discovery pipe string
+            if (actualData.size > 6) { 
+                val text = String(actualData, Charsets.UTF_8)
+                val parts = text.split("|")
+                if (parts.size >= 3) {
+                    val addr = parts[0].trim()
+                    val rssi = parts[1].trim().toIntOrNull() ?: 0
+                    val name = parts.getOrNull(2)?.trim()?.takeIf { it.isNotEmpty() && it != "Unknown" }
+                    val adv = parts.getOrNull(3)?.trim() ?: ""
+                    discoveredDevices[addr] = BluetoothDevice(addr, name, rssi, adv)
+                }
+            }
+        } catch (e: Exception) { /* silently ignore unparseable payloads */ }
     }
     // --- Helper methods (not part of the domain interface) ---
+
+    // Local cache of devices heard via asynchronous broadcasts
+    private val discoveredDevices = ConcurrentHashMap<String, BluetoothDevice>()
 
     /**
      * Subscribe to a notify characteristic (string UUID).

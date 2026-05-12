@@ -3,9 +3,15 @@ import asyncio
 import struct
 import logging
 import argparse
+import json
 from typing import Dict, Set
 from bleak import BleakClient, BleakScanner
 from simulated_door import SimulatedDoor
+import opener_protocol 
+
+# Use the vendor-specific GDO UUIDs
+WRITE_UUID = opener_protocol.WRITE_UUID 
+NOTIFY_UUID = opener_protocol.NOTIFY_UUID
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ble_daemon")
@@ -63,8 +69,8 @@ def detection_callback(device, advertisement_data):
         
     payload_str = f"{addr}|{rssi}|{name}|{adv_hex}"
     
-    # 0x07 = NOTIFY in Kotlin. Prepend 0x00 because Kotlin blindly strips the first byte!
-    msg_bytes = pack_msg(0x07, b"\x00" + payload_str.encode("utf-8"))
+    # 0x07 = NOTIFY in Kotlin. 
+    msg_bytes = pack_msg(0x07, payload_str.encode("utf-8"))
     loop = asyncio.get_event_loop()
     loop.call_soon(broadcast_discovery, msg_bytes)
 
@@ -104,22 +110,30 @@ class RealBleAdapter(BLEAdapter):
             return False
 
 class SimBleAdapter(BLEAdapter):
-    def __init__(self):
-        self.door = SimulatedDoor() # Uses your simulated_door.py
+    def __init__(self, door_instance: SimulatedDoor):
+        self.door = door_instance
     async def connect(self, address: str) -> bool:
         logger.info(f"SIM: Virtual connection to {address}")
         return True
-    async def write(self, address: str, data: bytes) -> bool:
-        logger.info(f"SIM: Processing write {data.hex()}")
-        self.door.write(data)
-        return True
 
+    async def write(self, address: str, data: bytes) -> bool:
+        self.door.write(data) 
+        
+        # Flush any immediate notifications (e.g., status or transition starts)
+        for payload in self.door.get_pending_notifications():
+            msg_bytes = pack_msg(0x07, payload) 
+            broadcast_discovery(msg_bytes) 
+        
+        return True
+        
 # --- The Router ---
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     peer = writer.get_extra_info('peername')
     logger.info(f"New TCP connection from {peer}")
     ACTIVE_TCP_WRITERS.add(writer)
     
+    current_device_addr = None
+
     try:
         while True:
             mtype, payload = await read_msg(reader)
@@ -140,6 +154,24 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 status_code = 0x02 if success else 0x01 # 02 = ACK, 01 = NAK
                 writer.write(pack_msg(0x06, struct.pack(">I", status_code)))
 
+            elif mtype == 0x07:  # DISCOVERY_REQ from Kotlin
+                logger.info("SIM: Received Discovery Request. Sending Mock JSON...")
+                
+                # This must match the JSON format in MacBluetoothManager.parseDiscoveryJson
+                mock_devices = [
+                    {
+                        "address": "1B59B01F-CCF0-7266-7928-5FD143F42BD6", 
+                        "name": "WoSwitchGDO",
+                        "rssi": -70,
+                        "adv": "0969aabbccddeeff"
+                    }
+                ]
+            
+                # Convert to JSON and pack as a type 0x08 response
+                json_payload = json.dumps(mock_devices).encode("utf-8")
+                writer.write(pack_msg(0x08, json_payload)) 
+                await writer.drain()
+
             elif mtype == 0x08:  # DISCONNECT
                 break
                 
@@ -155,8 +187,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 async def discovery_task():
     """Keeps the radio scanning in the background."""
     if SIMULATOR:
-        logger.info("Discovery Task: Running in Simulator Mode (No background scan)")
-        return 
+        return # The door handles its own discovery now!
 
     logger.info("Discovery Task: Starting Real-World BLE Scanner...")
     # Hook the callback we just wrote into the scanner
@@ -172,6 +203,9 @@ async def discovery_task():
     finally:
         await scanner.stop()
 
+def door_notification_bridge(payload: bytes):
+    msg_bytes = pack_msg(0x07, payload)
+    broadcast_discovery(msg_bytes)
 
 async def main():
     parser = argparse.ArgumentParser()
@@ -180,13 +214,31 @@ async def main():
 
     global SIMULATOR, ADAPTER
     SIMULATOR = not args.no_sim
-    ADAPTER = RealBleAdapter() if not SIMULATOR else SimBleAdapter()
+
+    if SIMULATOR:
+        # Create the door with its own identity
+        door_instance = SimulatedDoor(
+            address="1B59B01F-CCF0-7266-7928-5FD143F42BD6",
+            name="WoSwitchGDO"
+        )
+        ADAPTER = SimBleAdapter(door_instance) # Pass instance to adapter
+    else:
+        ADAPTER = RealBleAdapter()
 
     server = await asyncio.start_server(handle_client, TCP_HOST, TCP_PORT)
     logger.info(f"Daemon listening on {TCP_HOST}:{TCP_PORT} (SIM={SIMULATOR})")
+            
+    tasks = [
+        server.serve_forever(), 
+        discovery_task()
+    ]
     
-    async with server:
-        await asyncio.gather(server.serve_forever(), discovery_task())
+    if SIMULATOR:
+        # Start the door's self-contained engine
+        tasks.append(ADAPTER.door.run_heartbeat(door_notification_bridge))
+
+    logger.info(f"Daemon listening on {TCP_HOST}:{TCP_PORT} (SIM={SIMULATOR})")
+    await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
     asyncio.run(main())

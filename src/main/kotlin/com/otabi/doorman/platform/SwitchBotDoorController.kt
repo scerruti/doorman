@@ -6,6 +6,8 @@ import com.otabi.doorman.domain.DoorController
 import com.otabi.doorman.domain.DoorStatus
 import java.io.File
 import java.util.Properties
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.withTimeoutOrNull
 
 class SwitchBotDoorController(
     private val bluetoothManager: BluetoothManager
@@ -23,14 +25,45 @@ class SwitchBotDoorController(
         return try {
             val connection = bluetoothManager.connect(device).getOrThrow()
             
-            // We call sendCommand, but since it returns Result<Unit>, 
-            // we just check if the request was sent successfully.
-            connection.sendCommand(SwitchBotOpenerProtocol.statusCommand).getOrThrow()
-            
-            connection.disconnect()
-            
-            // Since we can't read the response bytes, we return UNKNOWN
-            Result.success(DoorStatus.UNKNOWN)
+            if (bluetoothManager is MacBluetoothManager) {
+                val deferredStatus = CompletableDeferred<DoorStatus>()
+
+                try {
+                    // 1. Listen: Set a temporary hook on the bluetoothManager.onNotify
+                    bluetoothManager.setNotifyCallback { payload ->
+                        val frame = if (payload.isNotEmpty() && payload[0] == 0x00.toByte()) payload.copyOfRange(1, payload.size) else payload
+                        
+                        // A status frame is exactly 6 bytes long. We filter out longer discovery packets.
+                        if (frame.size == 6) {
+                            val stateCode = frame[4].toInt() and 0xFF
+                            val parsedStatus = when (stateCode) {
+                                0x00 -> DoorStatus.CLOSED
+                                0x01 -> DoorStatus.OPEN
+                                0x02 -> DoorStatus.OPENING
+                                0x03 -> DoorStatus.CLOSING
+                                else -> null
+                            }
+                            if (parsedStatus != null) {
+                                deferredStatus.complete(parsedStatus)
+                            }
+                        }
+                    }
+
+                    // 2. Request: Send the statusCommand
+                    connection.sendCommand(SwitchBotOpenerProtocol.statusCommand).getOrThrow()
+                    
+                    // 3. Wait: Suspend until the notification arrives or a timeout occurs
+                    val status = withTimeoutOrNull(5000L) { deferredStatus.await() }
+                    
+                    if (status != null) Result.success(status) else Result.failure(Exception("Timeout waiting for status notification"))
+                } finally {
+                    // Cleanup the hook
+                    bluetoothManager.setNotifyCallback {}
+                }
+            } else {
+                connection.sendCommand(SwitchBotOpenerProtocol.statusCommand).getOrThrow()
+                Result.success(DoorStatus.UNKNOWN)
+            }
         } catch (e: Exception) {
             Result.failure(e)
         }
@@ -48,8 +81,6 @@ class SwitchBotDoorController(
             connection.sendCommand(command)
         } catch (e: Exception) {
             Result.failure(e)
-        } finally {
-            connection.disconnect()
         }
     }
 
@@ -87,7 +118,8 @@ private object DeviceSecrets {
 }
 
 private object SwitchBotOpenerProtocol {
-    val openCommand = byteArrayOf(0x57, 0x01, 0x01, 0x00, 0x00, 0x00)
-    val closeCommand = byteArrayOf(0x57, 0x01, 0x00, 0x00, 0x00, 0x00)
-    val statusCommand = byteArrayOf(0x57, 0x02, 0x00)
+    // Frames aligned with your Android capture for the GDO
+    val openCommand = hexStringToByteArray("570f31000000050102020000010000e5")
+    val closeCommand = hexStringToByteArray("570f31000000050101020000010000e4")
+    val statusCommand = hexStringToByteArray("570f31000000050100020000010000e3")
 }

@@ -34,6 +34,13 @@ class BleSocketClient(
     private lateinit var output: OutputStream
     @Volatile private var running = false
 
+    val isConnected: Boolean
+    get() = if (::socket.isInitialized) {
+        socket.isConnected && !socket.isClosed && running
+    } else {
+        false
+    }
+
     /** Callbacks */
     var onNotify: ((ByteArray) -> Unit)? = null
     var onWriteAck: ((ByteArray) -> Unit)? = null
@@ -45,18 +52,29 @@ class BleSocketClient(
      * Returns true on success.
      */
     fun connect(selector: String = "SwitchBot-KATA"): Boolean {
+        // Defensive Cleanup: Close existing socket before opening a new one
+        if (::socket.isInitialized) {
+            try { 
+                running = false
+                socket.close() 
+            } catch (_: Exception) {}
+        }
+
         socket = Socket(host, port)
         input = socket.getInputStream()
         output = socket.getOutputStream()
+        
         sendMessage(0x01.toByte(), selector.toByteArray(Charsets.UTF_8))
+        
         val (t, payload) = readMessage()
         if (t.toInt() != 0x02) return false
+        
         if (payload.isNotEmpty() && payload[0].toInt() == 0x00) {
             startReaderThread()
             return true
         }
         return false
-    }
+    }           
 
     /**
      * Subscribe to a notify characteristic (string UUID).
@@ -85,19 +103,6 @@ class BleSocketClient(
         payload[0] = 0x01
         System.arraycopy(raw, 0, payload, 1, raw.size)
         sendMessage(0x05.toByte(), payload)
-    }
-
-    /**
-     * Sends a DISCOVERY_REQ (0x07) and returns the DISCOVERY_RES (0x08).
-     * Note: This must be called BEFORE startReaderThread() or on a separate 
-     * temporary connection, otherwise the reader thread will "steal" the response.
-     */
-    fun sendDiscoveryRequest(): Pair<Byte, ByteArray> {
-        // sendMessage handles the 4-byte length and 1-byte type
-        sendMessage(0x07.toByte(), ByteArray(0))
-        
-        // readMessage() is private, so ensure this is inside BleSocketClient.kt
-        return readMessage() 
     }
 
     /**
@@ -130,8 +135,14 @@ class BleSocketClient(
     private fun readMessage(): Pair<Byte, ByteArray> {
         val lenBuf = ByteArray(4)
         input.readFully(lenBuf)
-        val len = ByteBuffer.wrap(lenBuf).int
-        val buf = ByteArray(len)
+        val mlen = ByteBuffer.wrap(lenBuf).int
+        
+        // Tightened Blast Shield: No GDO frame should exceed 64KB
+        if (mlen < 0 || mlen > 65536) { 
+            throw java.io.IOException("Corrupted frame: invalid length $mlen")
+        }
+        
+        val buf = ByteArray(mlen)
         input.readFully(buf)
         val t = buf[0]
         val payload = if (buf.size > 1) buf.copyOfRange(1, buf.size) else ByteArray(0)
