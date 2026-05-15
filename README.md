@@ -11,7 +11,7 @@ This app creates a distraction-free, context-aware system for managing garage do
 - **Location-Aware Triggers**: Uses geofencing to detect arrival/departure from home
 - **Bluetooth Control**: Direct BLE communication with SwitchBot devices (no internet required)
 - **Multi-Platform**: Android (AAOS + Phone) and macOS (testing)
-- **Secure Communication**: Encrypted Bluetooth commands with device password
+- **Direct Communication**: Local Bluetooth commands sent directly to the device
 - **Clean Architecture**: Modular design for easy testing and extension
 
 ## Supported Platforms
@@ -96,10 +96,7 @@ See [docs/test-plan.md](docs/test-plan.md) for detailed test procedures and vali
 ### SwitchBot Configuration
 1. Install SwitchBot app on your phone
 2. Add your garage door SwitchBot device
-3. **IMPORTANT**: Enable device password in device settings
-   - Go to device settings → Password
-   - Set a strong password (this secures Bluetooth communication)
-4. Store your device MAC address in a local ignored file:
+3. Store your device MAC address in a local ignored file:
    - Copy `device-secrets.example.properties` to `device-secrets.properties`
    - Set `switchbot.mac.address=AA:BB:CC:DD:EE:FF`
    - **Do not commit** `device-secrets.properties` to git.
@@ -107,9 +104,6 @@ See [docs/test-plan.md](docs/test-plan.md) for detailed test procedures and vali
      ```bash
      cp device-secrets.example.properties device-secrets.properties
      ```
-
-### Security Note
-By default, SwitchBot devices accept unencrypted Bluetooth commands. **Always enable the device password** to prevent unauthorized access via replay attacks.
 
 ## Development Workflow
 
@@ -172,7 +166,7 @@ The app requires the following permissions:
 
 ## Security Considerations
 
-- Bluetooth commands are encrypted using device password + timestamp
+- BLE commands are sent directly to the device MAC address
 - No sensitive data stored in plain text
 - All network communications use HTTPS
 - Regular security audits recommended

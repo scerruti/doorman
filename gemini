@@ -1,0 +1,92 @@
+I hear you. Let’s cut the fluff and get the technical specs locked in. You’re right—if the endgame is a USB-to-BLE bridge on AAOS, the Python daemon shouldn't have a single "smart" bone in its body. It needs to be a transparent bit-shifter.
+
+Here is the precise technical blueprint for the **Dumb Bridge (Python)** and the **Smart Controller (Kotlin)**, designed specifically for your hardware—which we’ve confirmed operates as a **Relay (Pulse)** on the `cba2` service rather than the standard GDO profile.
+
+---
+
+## 🏗 Part 1: The "Dumb" Python Bridge (Refactor Specs)
+
+The goal here is **Radio Transparency**. The daemon moves raw bytes between a TCP socket and the BLE stack.
+
+### 1. BLE Discovery (Service-Based)
+
+* **Scan Strategy:** Stop scanning for a specific MAC. Scan for all devices broadcasting **Service UUID:** `cba20d00-224d-11e6-9fb8-0002a5d5c51b`.
+* **Advertisement Passthrough:** For every matching device detected, push a **Type 0x03** packet to Kotlin.
+* **Packet Format:** `[0x03][MAC_STRING_LEN][MAC_STRING][MFR_DATA_LEN][RAW_MFR_DATA_BYTES]`
+* *Reason:* This allows Kotlin to decide which MAC to target and to parse the `0x43`/`0x46` status bits itself.
+
+
+
+### 2. Command Execution (TCP → Radio)
+
+* **Connect Command:** Expect a `CONNECT <MAC>` instruction from Kotlin. The daemon connects to the radio and subscribes to notifications on `cba20003-224d-11e6-9fb8-0002a5d5c51b`.
+* **Write Command (Type 0x01):** Kotlin sends a raw 17-byte buffer. The daemon writes it directly to Characteristic `cba20002-224d-11e6-9fb8-0002a5d5c51b`.
+* **Notify (Type 0x02):** Any raw bytes received from the radio are piped back to Kotlin.
+
+### 3. Simulator Mode (`--sim`)
+
+* Maintain a local dictionary of "Simulated Devices."
+* Every 1 second, emit fake **Type 0x03** advertisement packets.
+* Toggle the status byte (index 6 of mfr data) between `0x43` (Closed) and `0x46` (Open) whenever a **Type 0x01** write is received for that simulated MAC.
+
+---
+
+## 🧠 Part 2: The "Smart" Kotlin Controller (Refactor Specs)
+
+Kotlin owns the **Application, Security, and State** layers.
+
+### 1. Security & Encryption
+
+* **Encryption Key & ID:** Store the 32-char hex key and `0x51` ID here.
+* **Cipher:** Implement $AES-128-CTR$ via `javax.crypto.Cipher`.
+* **IV Construction:** Always use the 16-byte IV: `[KeyID (0x51)][15 null bytes]`.
+* **Sequence Number:** Maintain a persistent, incrementing counter.
+
+### 2. Packet Construction (The "Relay Pulse")
+
+To move the door, Kotlin must generate the 17-byte payload:
+
+1. **Header:** `0x51` (Key ID).
+2. **Payload (Encrypted):** 16 bytes consisting of `[Counter][0x57][0x01][0x01][12 null bytes]`.
+3. *Note:* Because your hardware uses the relay protocol, the command is always `0x57 01 01` (Toggle/Turn On). There is no discrete "Close" command.
+
+### 3. Status Parsing (The "Scan-Based" UI)
+
+Kotlin determines the UI state by parsing incoming **Type 0x03** (Scan) packets from the daemon:
+
+* **Logic:** Check bit 2 of index 6 in the Manufacturer Data.
+* `if (mfrData[6] & 0x04 != 0)` → **DOOR IS OPEN** (`0x46`)
+* `else` → **DOOR IS CLOSED** (`0x43`)
+
+
+
+---
+
+## 📝 Guidance for Code Assist
+
+Provide these specific steps to your coding tool to execute the refactor:
+
+> 1. **Refactor `ble_daemon.py`:**
+> * Remove all $AES$ encryption and key-handling logic.
+> * Implement a continuous scanner filtered by Service UUID `cba20d00-224d-11e6-9fb8-0002a5d5c51b`.
+> * Pipe all raw Manufacturer Data advertisements to the TCP client with a Type 0x03 header.
+> * Update `--sim` to emit these 0x03 packets periodically and toggle the status bits (0x43 vs 0x46) when a write is received.
+> 
+> 
+> 2. **Refactor Kotlin Controller:**
+> * Implement $AES-128-CTR$ encryption using the provided 32-char hex key.
+> * Manage the sequence counter and build the 17-byte "Pulse" packet (`0x51` + encrypted `[Counter] 57 01 01...`).
+> * Create a background listener for the Type 0x03 packets to update the door's "Open/Closed" UI state based on the Manufacturer Data bits.
+> * Ensure the "Open" and "Close" UI buttons both trigger the same 17-byte encrypted toggle command.
+> 
+> 
+> 
+> 
+
+---
+
+### The Reality Check
+
+By stripping the Python daemon of its smarts, you’ve made it a "Dumb Radio." When you eventually write the **Android USB code**, you will simply replace the TCP socket calls in Kotlin with USB serial calls. The encryption, sequence numbers, and relay-toggle logic will remain identical because they live in Kotlin.
+
+Does this separation of concerns align with how you're planning to handle the USB dongle?
