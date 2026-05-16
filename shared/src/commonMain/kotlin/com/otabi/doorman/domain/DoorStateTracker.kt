@@ -8,9 +8,18 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
+/**
+ * Tracks door state for a Relay‑based SwitchBot garage add‑on.
+ *
+ * Hardware only reports:
+ *   - OPEN  (magnet separated)
+ *   - CLOSED (magnet touching)
+ *
+ * OPENING and CLOSING are synthetic states based on timing.
+ */
 class DoorStateTracker(
     private val scope: CoroutineScope,
-    private val travelTimeMs: Long = 15000L // Approximate time for the motor to fully traverse the track
+    private val travelTimeMs: Long = 15000L
 ) {
     private val _syntheticState = MutableStateFlow(DoorStatus.UNKNOWN)
     val syntheticState: StateFlow<DoorStatus> = _syntheticState.asStateFlow()
@@ -19,60 +28,89 @@ class DoorStateTracker(
     private var motionJob: Job? = null
 
     /**
-     * Feeds raw hardware states from BLE advertisements into the tracker.
+     * Called whenever a BLE notification reports the magnet sensor state.
+     * This is the *authoritative* hardware state.
      */
     fun updateHardwareState(newState: DoorStatus) {
         if (rawHardwareState == newState) return
         rawHardwareState = newState
 
-        // If the magnet is touching, the door is definitively CLOSED.
-        if (newState == DoorStatus.CLOSED) {
-            motionJob?.cancel()
-            _syntheticState.value = DoorStatus.CLOSED
-        } 
-        // If the magnet is separated (OPEN), but we aren't currently tracking a transition,
-        // we assume the door is parked in the fully OPEN position.
-        else if (newState == DoorStatus.OPEN && _syntheticState.value !in listOf(DoorStatus.OPENING, DoorStatus.CLOSING)) {
-            _syntheticState.value = DoorStatus.OPEN
+        when (newState) {
+            DoorStatus.CLOSED -> {
+                // Door reached the floor — stop motion and finalize state
+                motionJob?.cancel()
+                _syntheticState.value = DoorStatus.CLOSED
+            }
+
+            DoorStatus.OPEN -> {
+                // Door reached the top — stop motion and finalize state
+                motionJob?.cancel()
+                _syntheticState.value = DoorStatus.OPEN
+            }
+
+            else -> Unit
         }
     }
 
     /**
-     * Called the moment we receive an ACK (Type 0x01) from the radio confirming the relay pulsed.
+     * Called when the relay pulse is acknowledged (TX notification received).
+     * This means "the button was pressed".
      */
     fun onCommandAcknowledged() {
         motionJob?.cancel()
 
-        when (_syntheticState.value) {
+        val current = _syntheticState.value
+
+        when (current) {
             DoorStatus.CLOSED -> {
+                // Start opening
                 _syntheticState.value = DoorStatus.OPENING
                 startMotionTimer(DoorStatus.OPEN)
             }
+
             DoorStatus.OPEN -> {
+                // Start closing
                 _syntheticState.value = DoorStatus.CLOSING
                 startMotionTimer(DoorStatus.CLOSED)
             }
-            DoorStatus.OPENING -> { // Button pressed while opening usually stops/reverses it
+
+            DoorStatus.OPENING -> {
+                // Button press while opening → reverse direction
                 _syntheticState.value = DoorStatus.CLOSING
                 startMotionTimer(DoorStatus.CLOSED)
             }
-            DoorStatus.CLOSING -> { // Button pressed while closing usually reverses it to open
+
+            DoorStatus.CLOSING -> {
+                // Button press while closing → reverse direction
                 _syntheticState.value = DoorStatus.OPENING
                 startMotionTimer(DoorStatus.OPEN)
             }
+
             DoorStatus.UNKNOWN -> {
-                // Fallback guess based on current hardware magnet
-                _syntheticState.value = if (rawHardwareState == DoorStatus.OPEN) DoorStatus.CLOSING else DoorStatus.OPENING
-                startMotionTimer(if (rawHardwareState == DoorStatus.OPEN) DoorStatus.CLOSED else DoorStatus.OPEN)
+                // Infer direction from hardware state
+                if (rawHardwareState == DoorStatus.OPEN) {
+                    _syntheticState.value = DoorStatus.CLOSING
+                    startMotionTimer(DoorStatus.CLOSED)
+                } else {
+                    _syntheticState.value = DoorStatus.OPENING
+                    startMotionTimer(DoorStatus.OPEN)
+                }
             }
         }
     }
 
+    /**
+     * Starts a synthetic motion timer. If hardware does not report OPEN/CLOSED
+     * before the timer expires, we assume the door reached the target.
+     */
     private fun startMotionTimer(targetState: DoorStatus) {
         motionJob = scope.launch {
             delay(travelTimeMs)
-            // If we were traveling OPEN, assume we reached the top of the track when the timer expires.
-            if (targetState == DoorStatus.OPEN) _syntheticState.value = DoorStatus.OPEN
+
+            // Only update if hardware hasn't already reported the final state
+            if (rawHardwareState != targetState) {
+                _syntheticState.value = targetState
+            }
         }
     }
 }
