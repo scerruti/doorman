@@ -1,18 +1,33 @@
+# Gradle
 .gradle/
 build/
-*.class
-*.jar
-*.iml
+**/build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# Kotlin Multiplatform
+shared/build/
+android-mobile/build/
+android-automotive/build/
+
+# IntelliJ / Android Studio
 .idea/
-.vscode/
-*.log
-*.log.last
-out/
+*.iml
+*.ipr
+*.iws
+
+# macOS
 .DS_Store
-device-secrets.properties
-analyze_target.py
-src/main/resources/sim_devices.json
-src/main/resources/real_devices.json
+
+# Logs
+*.log
+
+# Python junk (since you have scripts)
+__pycache__/
 *.pyc
-src/main/resources/__pycache__/
-bin/
+
+# JVM crash logs
+hs_err_pid*
+java_pid*.hprof
+
+# Generated resources
+**/generated/
