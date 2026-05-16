@@ -19,13 +19,15 @@ import kotlinx.coroutines.launch
  */
 class DoorStateTracker(
     private val scope: CoroutineScope,
-    private val travelTimeMs: Long = 15000L
+    private val travelTimeMs: Long = 15000L,
+    private val failsafeTimeMs: Long = travelTimeMs + travelTimeMs / 2
 ) {
     private val _syntheticState = MutableStateFlow(DoorStatus.UNKNOWN)
     val syntheticState: StateFlow<DoorStatus> = _syntheticState.asStateFlow()
 
     private var rawHardwareState = DoorStatus.UNKNOWN
     private var motionJob: Job? = null
+    private var transitionStartMs: Long = 0L
 
     /**
      * Called whenever a BLE notification reports the magnet sensor state.
@@ -34,16 +36,36 @@ class DoorStateTracker(
     fun updateHardwareState(newState: DoorStatus) {
         rawHardwareState = newState
 
-        when (newState) {
-            DoorStatus.CLOSED -> {
+        val current = _syntheticState.value
+        val msSinceTransition = System.currentTimeMillis() - transitionStartMs
+
+        when {
+            // OPENING + OPEN: hold animation for full travel time, ignore hardware confirmation.
+            current == DoorStatus.OPENING && newState == DoorStatus.OPEN -> return
+
+            // OPENING + CLOSED within grace: stale scan packet, ignore.
+            current == DoorStatus.OPENING && newState == DoorStatus.CLOSED && msSinceTransition < 2000L -> return
+
+            // OPENING + CLOSED after grace: door didn't open — report failure.
+            current == DoorStatus.OPENING && newState == DoorStatus.CLOSED -> {
                 motionJob?.cancel()
                 _syntheticState.value = DoorStatus.CLOSED
             }
-            DoorStatus.OPEN -> {
+
+            // CLOSING + OPEN: sensor stays OPEN throughout travel, ignore.
+            current == DoorStatus.CLOSING && newState == DoorStatus.OPEN -> return
+
+            // CLOSING + CLOSED: door confirmed closed (possibly early), accept it.
+            current == DoorStatus.CLOSING && newState == DoorStatus.CLOSED -> {
                 motionJob?.cancel()
-                _syntheticState.value = DoorStatus.OPEN
+                _syntheticState.value = DoorStatus.CLOSED
             }
-            else -> Unit
+
+            else -> when (newState) {
+                DoorStatus.CLOSED -> { motionJob?.cancel(); _syntheticState.value = DoorStatus.CLOSED }
+                DoorStatus.OPEN   -> { motionJob?.cancel(); _syntheticState.value = DoorStatus.OPEN }
+                else -> Unit
+            }
         }
     }
 
@@ -52,6 +74,7 @@ class DoorStateTracker(
      * This means "the button was pressed".
      */
     fun onCommandAcknowledged() {
+        transitionStartMs = System.currentTimeMillis()
         motionJob?.cancel()
 
         val current = _syntheticState.value
@@ -99,13 +122,12 @@ class DoorStateTracker(
      * before the timer expires, we assume the door reached the target.
      */
     private fun startMotionTimer(targetState: DoorStatus) {
+        // OPENING uses travelTimeMs — drives the animation; OPEN is suppressed from hardware.
+        // CLOSING uses failsafeTimeMs — hardware CLOSED is the primary resolution; this is the fallback.
+        val delay = if (targetState == DoorStatus.OPEN) travelTimeMs else failsafeTimeMs
         motionJob = scope.launch {
-            delay(travelTimeMs)
-
-            // Only update if hardware hasn't already reported the final state
-            if (rawHardwareState != targetState) {
-                _syntheticState.value = targetState
-            }
+            delay(delay)
+            _syntheticState.value = targetState
         }
     }
 }

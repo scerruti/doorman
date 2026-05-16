@@ -40,20 +40,22 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("ble_daemon")
 
 
-def load_creds(file_path):
+def load_device_config(file_path):
     if not os.path.exists(file_path):
         return None
     config = configparser.ConfigParser()
     with open(file_path, 'r') as f:
         config.read_string('[DEFAULT]\n' + f.read())
     try:
-        mac     = config.get('DEFAULT', 'switchbot.mac.address',           fallback='AA:BB:CC:DD:EE:FF').strip()
-        key_hex = config.get('DEFAULT', 'switchbot.device.encryption.key', fallback='').strip()
-        key_id  = config.get('DEFAULT', 'switchbot.device.key.id',         fallback='').strip()
+        mac            = config.get('DEFAULT', 'switchbot.mac.address',           fallback='AA:BB:CC:DD:EE:FF').strip()
+        key_hex        = config.get('DEFAULT', 'switchbot.device.encryption.key', fallback='').strip()
+        key_id         = config.get('DEFAULT', 'switchbot.device.key.id',         fallback='').strip()
+        travel_seconds = config.get('DEFAULT', 'switchbot.door.travel.seconds',   fallback='15').strip()
         return {
-            'mac':     mac or 'AA:BB:CC:DD:EE:FF',
-            'key_hex': key_hex,
-            'key_id':  int(key_id, 16) if key_id else 0,
+            'mac':            mac or 'AA:BB:CC:DD:EE:FF',
+            'key_hex':        key_hex,
+            'key_id':         int(key_id, 16) if key_id else 0,
+            'travel_seconds': int(travel_seconds) if travel_seconds else 15,
         }
     except Exception as e:
         logger.error(f"Error parsing {file_path}: {e}")
@@ -71,19 +73,21 @@ class DumbDaemon:
         # Maps real MAC → macOS UUID so we can pass the right handle to Bleak on connect
         self.mac_mapping = {}
 
-        creds = load_creds('device-secrets.properties')
-        sim_mac     = creds['mac']     if creds else 'AA:BB:CC:DD:EE:FF'
-        key_hex     = creds['key_hex'] if creds else ''
-        self._key    = bytes.fromhex(key_hex) if key_hex else None
-        self._key_id = creds['key_id'] if creds else 0
+        config = load_device_config('device-secrets.properties')
+        sim_mac        = config['mac']            if config else 'AA:BB:CC:DD:EE:FF'
+        key_hex        = config['key_hex']        if config else ''
+        self._key      = bytes.fromhex(key_hex)   if key_hex else None
+        self._key_id   = config['key_id']         if config else 0
+        travel_seconds = config['travel_seconds'] if config else 15
 
         if sim_mode:
             self.sim_door = SimulatedDoor(
                 address=sim_mac,
                 name='SwitchBot-Sim',
                 rssi=-50,
+                transition_duration=float(travel_seconds),
             )
-            logger.info(f"Simulator MAC: {sim_mac}")
+            logger.info(f"Simulator MAC: {sim_mac}, travel: {travel_seconds}s")
 
     # -------------------------------------------------------------------------
     # Server lifecycle
@@ -266,7 +270,7 @@ class DumbDaemon:
             for i, part in enumerate(door.address.split(':')):
                 mfr_bytes[i] = int(part, 16)
             # Byte 6 LSB: door state — 0 = OPEN, 1 = CLOSED (matches real device)
-            is_open = door.get_state() in ('OPEN', 'CLOSING')
+            is_open = door.get_state() != 'CLOSED'
             mfr_bytes[6] = 0x00 if is_open else 0x01
             self.send_scan_packet(door.address, door.rssi, door.name, bytes(mfr_bytes))
             await asyncio.sleep(1.0)

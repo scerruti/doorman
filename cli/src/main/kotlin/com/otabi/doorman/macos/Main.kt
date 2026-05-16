@@ -17,12 +17,15 @@ suspend fun main(): Unit = coroutineScope {
         ?.toByte(16)
         ?: error("switchbot.device.key.id is not configured")
 
+    val travelTimeMs = (loadProperty("switchbot.door.travel.seconds")
+        .takeIf { it.isNotBlank() }
+        ?.toLong() ?: 15L) * 1000L
+
     val bluetoothManager = MacBluetoothManager()
     val protocol = SwitchBotProtocol(keyHex)
     val cipher = AesCtr.fromHex(keyHex, keyId)
 
-    // For faster UI testing you can drop the travelTimeMs to 5000L
-    val controller = SwitchBotDoorController(bluetoothManager, gdoMac, protocol, cipher, this, travelTimeMs = 15000L)    
+    val controller = SwitchBotDoorController(bluetoothManager, gdoMac, protocol, cipher, this, travelTimeMs)    
 
     println("=== Doorman Garage Door Controller ===")
     println("Loaded configuration:")

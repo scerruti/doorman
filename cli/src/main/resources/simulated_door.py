@@ -38,15 +38,15 @@ class SimulatedDoor:
             Return cleartext notifications for the backend to deliver.
     """
 
-    # Duration (seconds) for OPENING/CLOSING transitions
-    TRANSITION_DURATION = 3.0
+    DEFAULT_TRANSITION_DURATION = 15.0
 
-    def __init__(self, address, name, rssi=-70, adv="0969aabbccddeeff", crypto=None, initial_state=None):
+    def __init__(self, address, name, rssi=-70, adv="0969aabbccddeeff", crypto=None, initial_state=None, transition_duration=None):
         self.address = address
         self.name = name
         self.rssi = rssi
         self.adv = adv
         self._last_adv_time = 0
+        self._transition_duration = transition_duration if transition_duration is not None else self.DEFAULT_TRANSITION_DURATION
 
         self.crypto = None
         if initial_state:
@@ -132,7 +132,7 @@ class SimulatedDoor:
         if self._door.state in ("OPEN", "OPENING"):
             return
         self._door.state = "OPENING"
-        self._door.transition_end = time.time() + self.TRANSITION_DURATION
+        self._door.transition_end = time.time() + self._transition_duration
         # No immediate notification — hardware only reports final OPEN/CLOSED state.
         # DoorStateTracker infers OPENING synthetically from the command acknowledgement.
 
@@ -140,7 +140,7 @@ class SimulatedDoor:
         if self._door.state in ("CLOSED", "CLOSING"):
             return
         self._door.state = "CLOSING"
-        self._door.transition_end = time.time() + self.TRANSITION_DURATION
+        self._door.transition_end = time.time() + self._transition_duration
         # No immediate notification — hardware only reports final OPEN/CLOSED state.
 
     def _handle_status_command(self) -> None:

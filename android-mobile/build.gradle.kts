@@ -20,9 +20,10 @@ android {
         versionCode = 1
         versionName = "1.0"
 
-        buildConfigField("String", "TARGET_MAC",     "\"${secrets["switchbot.mac.address"]          ?: ""}\"")
-        buildConfigField("String", "ENCRYPTION_KEY", "\"${secrets["switchbot.device.encryption.key"] ?: ""}\"")
-        buildConfigField("String", "KEY_ID",         "\"${secrets["switchbot.device.key.id"]         ?: ""}\"")
+        buildConfigField("String", "TARGET_MAC",      "\"${secrets["switchbot.mac.address"]          ?: ""}\"")
+        buildConfigField("String", "ENCRYPTION_KEY",  "\"${secrets["switchbot.device.encryption.key"] ?: ""}\"")
+        buildConfigField("String", "KEY_ID",          "\"${secrets["switchbot.device.key.id"]         ?: ""}\"")
+        buildConfigField("int",    "TRAVEL_SECONDS",  "${secrets["switchbot.door.travel.seconds"]      ?: 15}")
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17

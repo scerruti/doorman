@@ -64,7 +64,7 @@ class MainActivity : ComponentActivity() {
             protocol = protocol,
             cipher = cipher,
             scope = lifecycleScope,
-            travelTimeMs = 15000L
+            travelTimeMs = BuildConfig.TRAVEL_SECONDS * 1000L
         )
 
         // Listen to state changes in the background

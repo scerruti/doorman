@@ -9,12 +9,16 @@ class SwitchBotDoorController(
     private val bluetoothManager: BluetoothManager,
     private val macAddress: String,
     private val protocol: SwitchBotProtocol,
-    private val cipher: AesCtr,                    // add this
+    private val cipher: AesCtr,
     private val scope: CoroutineScope,
     private val travelTimeMs: Long = 15000L
 ) : DoorController {
 
-    private val stateTracker = DoorStateTracker(scope, travelTimeMs)
+    private val stateTracker = DoorStateTracker(
+        scope          = scope,
+        travelTimeMs   = travelTimeMs,
+        failsafeTimeMs = travelTimeMs + travelTimeMs / 2
+    )
 
     override val state: StateFlow<DoorStatus> = stateTracker.syntheticState
 
