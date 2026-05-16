@@ -54,6 +54,10 @@ actual class SwitchBotProtocol actual constructor(
         return packet
     }
 
+    actual fun parseNotification(data: ByteArray): DoorStatus {
+        return parseStatus(data)
+    }
+
     /**
      * Parses the Manufacturer Data from a Type 0x03 Scan Advertisement.
      */

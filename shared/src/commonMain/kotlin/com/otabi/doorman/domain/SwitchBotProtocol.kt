@@ -1,32 +1,21 @@
 package com.otabi.doorman.domain
 
-/**
- * SwitchBot protocol handler for classic, unencrypted UART devices
- * such as the Relay-based garage door add-on.
- *
- * @param keyHex Kept for API compatibility; unused for unencrypted devices.
- * @param keyId  Kept for API compatibility; unused for unencrypted devices.
- */
-expect class SwitchBotProtocol(
-    keyHex: String,
-    keyId: Byte = 0x51.toByte()
+class SwitchBotProtocol(
+    private val keyHex: String,
+    private val keyId: Byte = 0x51
 ) {
+    fun buildToggleCommand(): ByteArray {
+        // TODO: implement real command building
+        return byteArrayOf()
+    }
 
-    /**
-     * Builds a raw UART toggle command:
-     *   0x57 <len> 0x01 0x01 <checksum>
-     */
-    fun buildToggleCommand(): ByteArray
+    fun parseStatus(mfrData: ByteArray): DoorStatus {
+        // TODO: implement real status parsing
+        return DoorStatus.Unknown
+    }
 
-    /**
-     * Parses manufacturer data from BLE advertisements.
-     * Optional for this device; used only for coarse state.
-     */
-    fun parseStatus(mfrData: ByteArray): DoorStatus
-
-    /**
-     * Parses TX characteristic notifications from the real device.
-     * This is the authoritative door state (OPEN / CLOSED).
-     */
-    fun parseNotification(data: ByteArray): DoorStatus
+    fun parseNotification(data: ByteArray): DoorStatus {
+        // TODO: implement real notification parsing
+        return parseStatus(data)
+    }
 }
