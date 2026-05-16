@@ -17,7 +17,7 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.otabi.doorman.platform.AndroidBluetoothManager
-import com.otabi.doorman.platform.SwitchBotDoorController
+import com.otabi.doorman.domain.SwitchBotDoorController
 import com.otabi.doorman.domain.SwitchBotProtocol
 import kotlinx.coroutines.launch
 

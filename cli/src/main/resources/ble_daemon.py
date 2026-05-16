@@ -1,66 +1,90 @@
+#!/usr/bin/env python3
+"""
+ble_daemon.py — DumbDaemon: TCP bridge between Kotlin BLE clients and real or simulated hardware.
+
+Framing (both directions):
+    [4 bytes big-endian length][1 byte type][N bytes payload]
+
+Kotlin → Daemon:
+    0x01  WRITE      payload = raw characteristic bytes
+    0x04  CONNECT    payload = MAC address (UTF-8)
+    0x05  DISCONNECT (no payload)
+
+Daemon → Kotlin:
+    0x02  NOTIFY     payload = raw BLE notification bytes
+    0x03  SCAN       payload = [mac_len][mac][rssi_signed][name_len][name][mfr_len][mfr_bytes]
+"""
 import asyncio
-import random
 import struct
 import argparse
 import logging
+import os
+import configparser
 from bleak import BleakScanner, BleakClient
+from simulated_door import SimulatedDoor
+import opener_protocol
 
-# SwitchBot Service and Characteristics (classic UART)
 SERVICE_UUID = "cba20d00-224d-11e6-9fb8-0002a5d5c51b"
-RX_CHAR_UUID = "cba20002-224d-11e6-9fb8-0002a5d5c51b"  # Write
-TX_CHAR_UUID = "cba20003-224d-11e6-9fb8-0002a5d5c51b"  # Notify
+RX_CHAR_UUID = opener_protocol.WRITE_UUID
+TX_CHAR_UUID = opener_protocol.NOTIFY_UUID
 
-# TCP Message Types (Wire Protocol)
-MSG_TYPE_WRITE = 0x01
-MSG_TYPE_NOTIFY = 0x02
-MSG_TYPE_SCAN = 0x03
-MSG_TYPE_CONNECT = 0x04
+MSG_TYPE_WRITE      = 0x01
+MSG_TYPE_NOTIFY     = 0x02
+MSG_TYPE_SCAN       = 0x03
+MSG_TYPE_CONNECT    = 0x04
 MSG_TYPE_DISCONNECT = 0x05
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("ble_daemon")
 
 
+def load_creds(file_path):
+    if not os.path.exists(file_path):
+        return None
+    config = configparser.ConfigParser()
+    with open(file_path, 'r') as f:
+        config.read_string('[DEFAULT]\n' + f.read())
+    try:
+        mac = config.get('DEFAULT', 'switchbot.mac.address', fallback='AA:BB:CC:DD:EE:FF').strip()
+        return {'mac': mac or 'AA:BB:CC:DD:EE:FF'}
+    except Exception as e:
+        logger.error(f"Error parsing {file_path}: {e}")
+        return None
+
+
 class DumbDaemon:
-    """
-    TCP <-> BLE bridge for a SwitchBot Relay-style device using the classic
-    unencrypted UART protocol.
-
-    - Over TCP:
-        * Client sends:
-            - 0x01 <payload>      => WRITE to RX_CHAR_UUID
-            - 0x04 <mac-string>   => CONNECT to device
-            - 0x05                => DISCONNECT
-        * Daemon sends:
-            - 0x03 ...            => SCAN results
-            - 0x02 <ble-data>     => NOTIFY from TX_CHAR_UUID
-
-    - Over BLE:
-        * Writes are raw SwitchBot UART frames (e.g. 57 01 01 5F for toggle).
-        * Notifications are forwarded as-is.
-    """
-
-    def __init__(self, host="127.0.0.1", port=9000, sim_mode=False):
+    def __init__(self, host='127.0.0.1', port=9000, sim_mode=False):
         self.host = host
         self.port = port
         self.sim_mode = sim_mode
-
         self.clients = set()
         self.scanner = None
-        self.active_client: BleakClient | None = None
-        self.mac_mapping: dict[str, str] = {}
+        self.active_client = None
+        # Maps real MAC → macOS UUID so we can pass the right handle to Bleak on connect
+        self.mac_mapping = {}
 
-        # Simulator state
-        self.sim_door_open = False
-        # Give the simulated device a stable fake MAC
-        self.sim_mac = "AA:BB:CC:DD:EE:FF"
+        creds = load_creds('device-secrets.properties')
+        sim_mac = creds['mac'] if creds else 'AA:BB:CC:DD:EE:FF'
+
+        if sim_mode:
+            self.sim_door = SimulatedDoor(
+                address=sim_mac,
+                name='SwitchBot-Sim',
+                rssi=-50,
+            )
+            logger.info(f"Simulator MAC: {sim_mac}")
+
+    # -------------------------------------------------------------------------
+    # Server lifecycle
+    # -------------------------------------------------------------------------
 
     async def start(self):
         server = await asyncio.start_server(self.handle_client, self.host, self.port)
-        logger.info(f"Dumb Relay Daemon listening on {self.host}:{self.port} (Sim Mode: {self.sim_mode})")
+        logger.info(f"DumbDaemon listening on {self.host}:{self.port}  sim={self.sim_mode}")
 
         if self.sim_mode:
             asyncio.create_task(self.sim_scan_loop())
+            asyncio.create_task(self.sim_heartbeat_loop())
         else:
             self.scanner = BleakScanner(self.detection_callback)
             await self.scanner.start()
@@ -69,96 +93,85 @@ class DumbDaemon:
             await server.serve_forever()
 
     # -------------------------------------------------------------------------
-    # TCP side
+    # TCP transport
     # -------------------------------------------------------------------------
 
     def broadcast_tcp(self, data: bytes):
-        # Length-prefixed buffer
-        packet = struct.pack(">I", len(data)) + data
-        dead = []
-        for w in self.clients:
+        packet = struct.pack('>I', len(data)) + data
+        for w in list(self.clients):
             try:
                 w.write(packet)
             except Exception as e:
-                logger.error(f"Failed to write to client: {e}")
-                dead.append(w)
-        for w in dead:
-            self.clients.discard(w)
+                logger.error(f"broadcast_tcp failed: {e}")
 
-    async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    async def handle_client(self, reader, writer):
         self.clients.add(writer)
-        logger.info("Kotlin Controller connected via TCP")
+        logger.info("Kotlin client connected via TCP")
         try:
             while True:
                 length_bytes = await reader.readexactly(4)
-                length = struct.unpack(">I", length_bytes)[0]
+                length = struct.unpack('>I', length_bytes)[0]
                 data = await reader.readexactly(length)
                 if not data:
                     break
 
                 msg_type = data[0]
-                payload = data[1:]
+                payload  = data[1:]
 
                 if msg_type == MSG_TYPE_WRITE:
-                    logger.info(f"Received WRITE (0x01) -> {payload.hex()}")
+                    logger.info(f"WRITE → {payload.hex()}")
                     await self.handle_write(payload)
                 elif msg_type == MSG_TYPE_CONNECT:
-                    mac = payload.decode("utf-8")
-                    logger.info(f"Received CONNECT (0x04) -> {mac}")
+                    mac = payload.decode('utf-8')
+                    logger.info(f"CONNECT → {mac}")
                     await self.handle_connect(mac)
                 elif msg_type == MSG_TYPE_DISCONNECT:
-                    logger.info("Received DISCONNECT (0x05)")
+                    logger.info("DISCONNECT")
                     await self.handle_disconnect()
+
         except asyncio.IncompleteReadError:
             pass
         except Exception as e:
             logger.error(f"TCP client error: {e}")
         finally:
-            logger.info("Kotlin Controller disconnected")
+            logger.info("Kotlin client disconnected")
             self.clients.discard(writer)
             writer.close()
 
     # -------------------------------------------------------------------------
-    # BLE scanning and mapping
+    # Real BLE — scanner callback (with macOS UUID → real MAC substitution)
     # -------------------------------------------------------------------------
 
     def detection_callback(self, device, advertisement_data):
-        # Identify SwitchBot-like devices by service UUID or manufacturer ID 0x0969
-        is_switchbot = False
-        if SERVICE_UUID.lower() in [str(u).lower() for u in advertisement_data.service_uuids]:
-            is_switchbot = True
-        elif 0x0969 in advertisement_data.manufacturer_data:
-            is_switchbot = True
-
+        is_switchbot = (
+            SERVICE_UUID.lower() in [str(u).lower() for u in advertisement_data.service_uuids]
+            or 0x0969 in advertisement_data.manufacturer_data
+        )
         if not is_switchbot:
             return
 
         mfr_data = advertisement_data.manufacturer_data
-        if mfr_data:
-            for mfr_id, mfr_bytes in mfr_data.items():
-                mfr_bytes_obj = bytes(mfr_bytes)
-                reported_mac = device.address
+        for mfr_id, mfr_bytes in mfr_data.items():
+            mfr_bytes = bytes(mfr_bytes)
+            reported_mac = device.address
 
-                # Many SwitchBot devices encode the real MAC in the first 6 bytes
-                if len(mfr_bytes_obj) >= 6:
-                    real_mac = ":".join(f"{b:02X}" for b in mfr_bytes_obj[:6])
-                    reported_mac = real_mac
+            # macOS hides the real MAC behind a per-boot UUID.
+            # SwitchBot embeds the real MAC as the first 6 bytes of company-ID 0x0969 data.
+            if mfr_id == 0x0969 and len(mfr_bytes) >= 6:
+                real_mac = ':'.join(f'{b:02X}' for b in mfr_bytes[:6])
+                reported_mac = real_mac
+                logger.info(f"GDO: {device.name} uuid={device.address} → mac={real_mac} RSSI={advertisement_data.rssi}")
 
-                # Map the "real" MAC to the OS-specific address
-                self.mac_mapping[reported_mac] = device.address
+            # Keep reverse mapping so handle_connect can pass the UUID back to Bleak
+            self.mac_mapping[reported_mac] = device.address
 
-                self.send_scan_packet(
-                    reported_mac,
-                    advertisement_data.rssi,
-                    device.name,
-                    mfr_bytes_obj,
-                )
+            self.send_scan_packet(reported_mac, advertisement_data.rssi, device.name, mfr_bytes)
 
     # -------------------------------------------------------------------------
-    # BLE connect / disconnect / write / notify
+    # Real BLE — connect / disconnect / write / notify
     # -------------------------------------------------------------------------
 
-    async def handle_connect(self, mac: str):
+    async def handle_connect(self, mac):
         if self.sim_mode:
             logger.info(f"[SIM] Connected to {mac}")
             return
@@ -166,148 +179,99 @@ class DumbDaemon:
         if self.active_client and self.active_client.is_connected:
             await self.active_client.disconnect()
 
-        target_address = self.mac_mapping.get(mac, mac)
-        logger.info(f"Resolving hardware handle for {target_address} (requested: {mac})...")
-
-        device = await BleakScanner.find_device_by_address(target_address, timeout=10.0)
+        # Resolve back to macOS UUID handle (required by Bleak on macOS)
+        target = self.mac_mapping.get(mac, mac)
+        logger.info(f"Resolving {target} (requested {mac})…")
+        device = await BleakScanner.find_device_by_address(target, timeout=10.0)
         if not device:
-            logger.error(f"Failed to connect: Device {target_address} not found in range.")
+            logger.error(f"Device {target} not found")
             return
 
         self.active_client = BleakClient(device)
         try:
             await self.active_client.connect()
-            logger.info(f"Connected to BLE device {mac}")
+            logger.info(f"Connected to {mac}")
             await self.active_client.start_notify(TX_CHAR_UUID, self.notify_callback)
         except Exception as e:
-            logger.error(f"Failed to connect to {mac}: {e}")
-            self.active_client = None
+            logger.error(f"Connect failed: {e}")
 
     async def handle_disconnect(self):
         if self.sim_mode:
             logger.info("[SIM] Disconnected")
             return
-
         if self.active_client and self.active_client.is_connected:
             await self.active_client.disconnect()
             logger.info("Disconnected from BLE device")
-        self.active_client = None
 
-    async def handle_write(self, data: bytes):
-        """
-        For real hardware:
-            - 'data' is a raw SwitchBot UART frame (e.g. 57 01 01 5F).
-            - We write it directly to RX_CHAR_UUID with no encryption.
-
-        For sim mode:
-            - We interpret the frame and drive the simulated door state.
-        """
+    async def handle_write(self, data):
         if self.sim_mode:
-            await self.handle_write_sim(data)
+            logger.info(f"[SIM] Write {data.hex()}")
+            self.sim_door.write(data)
+            for payload in self.sim_door.get_pending_notifications():
+                logger.info(f"[SIM] Notification → {payload.hex()}")
+                self.broadcast_tcp(bytes([MSG_TYPE_NOTIFY]) + payload)
             return
 
         if self.active_client and self.active_client.is_connected:
             try:
                 await self.active_client.write_gatt_char(RX_CHAR_UUID, data, response=False)
-                logger.info(f"Raw payload written to radio: {data.hex()}")
+                logger.info("Write OK")
             except Exception as e:
                 logger.error(f"Write failed: {e}")
-        else:
-            logger.warning("WRITE requested but no active BLE connection")
 
-    def notify_callback(self, sender, data: bytes):
-        logger.info(f"Notification from radio: {data.hex()}")
-        packet = bytearray([MSG_TYPE_NOTIFY])
-        packet.extend(data)
-        self.broadcast_tcp(bytes(packet))
+    def notify_callback(self, sender, data):
+        logger.info(f"BLE notify: {bytes(data).hex()}")
+        self.broadcast_tcp(bytes([MSG_TYPE_NOTIFY]) + bytes(data))
 
     # -------------------------------------------------------------------------
-    # Simulation mode (no encryption, just fake a relay + door sensor)
+    # Simulator loops
     # -------------------------------------------------------------------------
-
-    async def handle_write_sim(self, data: bytes):
-        """
-        Simulate a SwitchBot Relay-like device.
-
-        We assume a simple "toggle" command is sent as a SwitchBot UART frame.
-        For example, many devices use:
-            57 01 01 XX
-        where XX is a checksum.
-
-        Here we just look for the 57 01 01 prefix and treat it as "toggle".
-        """
-        logger.info(f"[SIM] Payload received: {data.hex()}")
-
-        if len(data) >= 3 and data[0] == 0x57 and data[1] == 0x01 and data[2] == 0x01:
-            logger.info("[SIM] TOGGLE command detected. Motor activated.")
-            # Immediately send a "relay activated" notification (fake format)
-            # You can adjust this to match whatever your Kotlin side expects.
-            notify = bytearray([MSG_TYPE_NOTIFY, 0x01])
-            self.broadcast_tcp(bytes(notify))
-
-            # Start door movement simulation
-            asyncio.create_task(self.simulate_physical_movement())
-        else:
-            logger.warning(f"[SIM] Unknown command frame: {data.hex()}")
-
-    async def simulate_physical_movement(self):
-        logger.info("[SIM] Door is in motion...")
-        if not self.sim_door_open:
-            # Opening: magnet separates almost immediately
-            await asyncio.sleep(1.0)
-            self.sim_door_open = True
-            logger.info("[SIM] Magnet separated. Sensor reading is now OPEN.")
-        else:
-            # Closing: magnet touches only when door hits the floor
-            await asyncio.sleep(15.0)
-            self.sim_door_open = False
-            logger.info("[SIM] Door reached floor. Sensor reading is now CLOSED.")
 
     async def sim_scan_loop(self):
-        """
-        Periodically emit a fake scan result for the simulated device.
-
-        We keep the manufacturer data arbitrary but stable enough that the
-        Kotlin side can treat it like a real SwitchBot advertisement.
-        """
+        """Broadcast periodic scan advertisements for the simulated device."""
         while True:
+            door = self.sim_door
             mfr_bytes = bytearray(13)
-
-            # Encode door state in one byte (arbitrary convention):
-            # 0x9A = open, 0x9B = closed (matches your earlier pattern)
-            mfr_bytes[6] = 0x9A if self.sim_door_open else 0x9B
-
-            self.send_scan_packet(self.sim_mac, -50, "SwitchBot-Sim", mfr_bytes)
+            # Bytes 0-5: MAC address (matches real hardware layout)
+            for i, part in enumerate(door.address.split(':')):
+                mfr_bytes[i] = int(part, 16)
+            # Byte 6 LSB: door state — 0 = OPEN, 1 = CLOSED (matches real device)
+            is_open = door.get_state() in ('OPEN', 'CLOSING')
+            mfr_bytes[6] = 0x00 if is_open else 0x01
+            self.send_scan_packet(door.address, door.rssi, door.name, bytes(mfr_bytes))
             await asyncio.sleep(1.0)
 
+    async def sim_heartbeat_loop(self):
+        """Advance simulated door time and flush transition notifications."""
+        import time
+        while True:
+            self.sim_door.tick(time.time())
+            for payload in self.sim_door.get_pending_notifications():
+                logger.info(f"[SIM] Heartbeat notify → {payload.hex()}")
+                self.broadcast_tcp(bytes([MSG_TYPE_NOTIFY]) + payload)
+            await asyncio.sleep(0.5)
+
     # -------------------------------------------------------------------------
-    # Scan packet -> TCP
+    # Scan packet encoder (binary 0x03 format)
     # -------------------------------------------------------------------------
 
     def send_scan_packet(self, mac: str, rssi: int, name: str, mfr_bytes: bytes):
-        mac_bytes = mac.encode("utf-8")
-        name_bytes = (name or "Unknown").encode("utf-8")
+        mac_b   = mac.encode('utf-8')
+        name_b  = (name or '').encode('utf-8')
+        rssi_b  = max(-128, min(127, rssi)).to_bytes(1, byteorder='big', signed=True)
 
-        packet = bytearray()
-        packet.append(MSG_TYPE_SCAN)  # 0x03
-        packet.append(len(mac_bytes))
-        packet.extend(mac_bytes)
-
-        # Pack RSSI as signed 1-byte integer
-        packet.extend(max(-128, min(127, rssi)).to_bytes(1, byteorder="big", signed=True))
-
-        packet.append(len(name_bytes))
-        packet.extend(name_bytes)
-
-        packet.append(len(mfr_bytes))
-        packet.extend(mfr_bytes)
+        packet = bytearray([MSG_TYPE_SCAN])
+        packet.append(len(mac_b));  packet.extend(mac_b)
+        packet.extend(rssi_b)
+        packet.append(len(name_b)); packet.extend(name_b)
+        packet.append(len(mfr_bytes)); packet.extend(mfr_bytes)
 
         self.broadcast_tcp(bytes(packet))
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--sim", action="store_true", help="Run as a simulated SwitchBot device")
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Doorman BLE daemon')
+    parser.add_argument('--sim', action='store_true', help='Use simulated door (default: real hardware)')
     args = parser.parse_args()
 
     daemon = DumbDaemon(sim_mode=args.sim)

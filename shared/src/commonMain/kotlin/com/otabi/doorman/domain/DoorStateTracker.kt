@@ -32,22 +32,17 @@ class DoorStateTracker(
      * This is the *authoritative* hardware state.
      */
     fun updateHardwareState(newState: DoorStatus) {
-        if (rawHardwareState == newState) return
         rawHardwareState = newState
 
         when (newState) {
             DoorStatus.CLOSED -> {
-                // Door reached the floor — stop motion and finalize state
                 motionJob?.cancel()
                 _syntheticState.value = DoorStatus.CLOSED
             }
-
             DoorStatus.OPEN -> {
-                // Door reached the top — stop motion and finalize state
                 motionJob?.cancel()
                 _syntheticState.value = DoorStatus.OPEN
             }
-
             else -> Unit
         }
     }

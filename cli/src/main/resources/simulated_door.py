@@ -15,23 +15,6 @@ from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
 import time
 
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-
-def encrypt_payload(data, key, key_id):
-    iv = key_id + b'\x00' * 15
-    cipher = Cipher(algorithms.AES(key), modes.CTR(iv))
-    encryptor = cipher.encryptor()
-    return key_id + encryptor.update(data) + encryptor.finalize()
-
-def decrypt_payload(data, key):
-    if len(data) != 17:
-        return data
-    key_id = data[0:1]
-    iv = key_id + b'\x00' * 15
-    cipher = Cipher(algorithms.AES(key), modes.CTR(iv))
-    decryptor = cipher.decryptor()
-    return decryptor.update(data[1:]) + decryptor.finalize()
-
 
 @dataclass
 class DoorState:
@@ -58,17 +41,14 @@ class SimulatedDoor:
     # Duration (seconds) for OPENING/CLOSING transitions
     TRANSITION_DURATION = 3.0
 
-    def __init__(self, address, name, rssi=-70, adv="0969aabbccddeeff", crypto=None, initial_state=None, key=None, key_id=None):
+    def __init__(self, address, name, rssi=-70, adv="0969aabbccddeeff", crypto=None, initial_state=None):
         self.address = address
         self.name = name
         self.rssi = rssi
         self.adv = adv
         self._last_adv_time = 0
-        self.notifications_enabled = False  # Start silent  
 
         self.crypto = None
-        self.key = key
-        self.key_id = key_id
         if initial_state:
             self._door = DoorState(
                 state=initial_state["state"],
@@ -83,51 +63,30 @@ class SimulatedDoor:
     # Public API
     # -------------------------------------------------------------------------
 
-    def process_incoming(self, data: bytes) -> bool:
-        payload = data
-        
-        # 1. Logic Gate: If encryption is expected, validate and decrypt
-        if self.key:
-            if len(data) != 17:
-                print(f"SIM: Rejected. Encryption enabled, but received {len(data)} bytes (expected 17).", flush=True)
-                return False
-                
-            received_id = data[0:1]
-            if received_id != self.key_id:
-                print(f"SIM: Rejected. Expected Key ID {self.key_id.hex()}, got {received_id.hex()}", flush=True)
-                return False
-                
-            payload = decrypt_payload(data, self.key)
-            print("SIM: Decrypted 17-byte command.", flush=True)
-        
-        # 2. Process the resulting 16-byte command
-        return self._handle_command(payload)
-
-    def _handle_command(self, frame: bytes) -> bool:
+    def write(self, frame: bytes) -> None:
         """
-        Accept cleartext 16‑byte command frames directly.
+        Accept 16-byte SwitchBot Relay Switch command frames.
 
-        Real Opener opcodes (byte 8):
-            0x00 = status
-            0x02 = open
-            0x01 = close
+        Relay protocol (frame[0] == 0x57):
+            frame[1] == 0x01, frame[2] == 0x01  →  relay ON  (open door)
+            frame[1] == 0x01, frame[2] == 0x00  →  relay OFF (close door)
+            frame[1] == 0x02                    →  get status
         """
-        if len(frame) != 16:
-            print(f"SimulatedDoor: invalid frame length {len(frame)}", flush=True)
-            return False
+        if len(frame) < 2 or frame[0] != 0x57:
+            print(f"SimulatedDoor: unrecognised frame {frame.hex()}", flush=True)
+            return
 
-        opcode = frame[8]
-
-        if opcode == 0x00:
+        cmd = frame[1]
+        if cmd == 0x01:
+            # Single toggle: open if closed/closing, close if open/opening
+            if self._door.state in ("CLOSED", "CLOSING"):
+                self._handle_open_command()
+            else:
+                self._handle_close_command()
+        elif cmd == 0x02:
             self._handle_status_command()
-        elif opcode == 0x02:
-            self._handle_open_command()
-        elif opcode == 0x01:
-            self._handle_close_command()
         else:
-            print(f"SimulatedDoor: unknown opcode {opcode}", flush=True)
-            return False
-        return True
+            print(f"SimulatedDoor: unknown command byte {cmd:#04x}", flush=True)
 
     def tick(self, now: float) -> None:
         """
@@ -172,40 +131,23 @@ class SimulatedDoor:
     def _handle_open_command(self) -> None:
         if self._door.state in ("OPEN", "OPENING"):
             return
-
-        # Start OPENING transition
         self._door.state = "OPENING"
         self._door.transition_end = time.time() + self.TRANSITION_DURATION
-
-        # Immediate transition notification
-        self._queue_notification({
-            "type": "transition",
-            "state": "OPENING",
-            "battery": 100,
-        })
+        # No immediate notification — hardware only reports final OPEN/CLOSED state.
+        # DoorStateTracker infers OPENING synthetically from the command acknowledgement.
 
     def _handle_close_command(self) -> None:
         if self._door.state in ("CLOSED", "CLOSING"):
             return
-
-        # Start CLOSING transition
         self._door.state = "CLOSING"
         self._door.transition_end = time.time() + self.TRANSITION_DURATION
-
-        # Immediate transition notification
-        self._queue_notification({
-            "type": "transition",
-            "state": "CLOSING",
-            "battery": 100,
-        })
+        # No immediate notification — hardware only reports final OPEN/CLOSED state.
 
     def _handle_status_command(self) -> None:
-        # Immediate status notification
-        self._queue_notification({
-            "type": "status",
-            "state": self._door.state,
-            "battery": 100,
-        })
+        state = self._door.state
+        # Report physical state: OPENING is still CLOSED, CLOSING is still OPEN
+        physical = "OPEN" if state in ("OPEN", "CLOSING") else "CLOSED"
+        self._queue_notification({"type": "status", "state": physical, "battery": 100})
 
     # -------------------------------------------------------------------------
     # Notification helpers
@@ -213,16 +155,12 @@ class SimulatedDoor:
 
     def _queue_notification(self, logical: Dict[str, Any]) -> None:
         """
-        Convert a logical notification into a real-device 6‑byte payload.
-
-        Real device format:
-            [version=1, battery, 0, 0, state_code, 1]
+        6-byte payload. State is in LSB of byte 4: 0x00 = CLOSED, 0x01 = OPEN.
+        OPENING/CLOSING are synthetic Kotlin states — hardware only reports OPEN/CLOSED.
         """
         state_map = {
-            "CLOSED":   0x00,
-            "OPEN":     0x01,
-            "OPENING":  0x02,
-            "CLOSING":  0x03,
+            "OPEN":   0x00,
+            "CLOSED": 0x01,
         }
 
         state_code = state_map.get(logical["state"], 0x00)
@@ -236,11 +174,6 @@ class SimulatedDoor:
             state_code,  # state code
             0x01,        # constant tail (matches real device)
         ])
-
-        # 3. If encryption is enabled, wrap the response
-        if getattr(self, 'key', None):
-            full_frame = payload + b'\x00' * 10
-            payload = encrypt_payload(full_frame, self.key, self.key_id)
 
         self._pending_notifications.append(payload)
 
@@ -261,16 +194,15 @@ class SimulatedDoor:
             now = time.time()
             self.tick(now)
             
-            # 1. Periodic Discovery "Shout" (Every 0.5 seconds)
-            if now - self._last_adv_time >= 0.5:
+            # 1. Periodic Discovery "Shout" (Every 5 seconds)
+            if now - self._last_adv_time >= 5.0:
                 discovery_str = f"{self.address}|{self.rssi}|{self.name}|{self.adv}"
                 # Send as a pipe-delimited string (Type 0x07)
                 send_callback(discovery_str.encode("utf-8"))
                 self._last_adv_time = now
 
             # 2. State-Change Notifications (Transition/Complete/Status)
-            if self.notifications_enabled:
-                for payload in self.get_pending_notifications():
-                    send_callback(payload)
+            for payload in self.get_pending_notifications():
+                send_callback(payload)
                 
             await asyncio.sleep(0.5)

@@ -48,7 +48,7 @@ class MacBluetoothManager(
                         val msg = readLengthPrefixedMessage(input!!) ?: break
                         val mtype = msg[0].toInt() and 0xFF
                         val payload = msg.copyOfRange(1, msg.size)
-                        
+
                         when (mtype) {
                             0x02 -> { // NOTIFY
                                 _notifications.emit(payload)
@@ -63,7 +63,7 @@ class MacBluetoothManager(
                                     val rssi = payload[offset++].toInt()
 
                                     val nameLen = payload[offset++].toInt() and 0xFF
-                                    val nameStr = String(payload, offset, nameLen, Charsets.UTF_8)
+                                    val nameStr = if (nameLen > 0) String(payload, offset, nameLen, Charsets.UTF_8) else null
                                     offset += nameLen
 
                                     val mfrLen = payload[offset++].toInt() and 0xFF
@@ -77,18 +77,44 @@ class MacBluetoothManager(
                                             rssi = rssi
                                         )
                                     )
-                                } catch (e: Exception) {
-                                    // ignore malformed packets
+                                } catch (_: Exception) { /* ignore malformed scan packets */ }
+                            }
+                            0x07 -> { // newer daemon: discovery OR notification
+                                val payloadStr = payload.toString(Charsets.UTF_8)
+                                if (payloadStr.contains('|')) {
+                                    // Discovery: "addr|rssi|name|advHex"
+                                    try {
+                                        val parts = payloadStr.split('|', limit = 4)
+                                        if (parts.size >= 2) {
+                                            val macStr = parts[0]
+                                            val rssi = parts[1].toIntOrNull() ?: 0
+                                            val nameStr = if (parts.size >= 3 && parts[2].isNotEmpty()) parts[2] else null
+                                            val advHex = if (parts.size >= 4) parts[3] else ""
+                                            val mfrBytes = try {
+                                                advHex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+                                            } catch (_: Exception) { ByteArray(0) }
+                                            _advertisements.emit(
+                                                BleDeviceAdvertisement(
+                                                    macAddress = macStr,
+                                                    name = nameStr,
+                                                    manufacturerData = mfrBytes,
+                                                    rssi = rssi
+                                                )
+                                            )
+                                        }
+                                    } catch (_: Exception) { /* ignore malformed discovery */ }
+                                } else {
+                                    _notifications.emit(payload)
                                 }
                             }
                         }
                     }
-                } catch (e: Exception) {
+                } catch (_: Exception) {
                     socket?.close()
                 }
             }
         } catch (e: Exception) {
-            println("Failed to connect to MacBluetoothManager Daemon: ${e.message}")
+            println("MacBluetoothManager: daemon unreachable at $host:$port — ${e.message}")
         }
     }
 
@@ -100,7 +126,7 @@ class MacBluetoothManager(
             val body = ByteArray(len)
             input.readFully(body)
             body
-        } catch (e: Exception) { null }
+        } catch (_: Exception) { null }
     }
 
     private fun sendTcpMessage(type: Int, payload: ByteArray = ByteArray(0)) {
@@ -111,8 +137,10 @@ class MacBluetoothManager(
         val buf = ByteBuffer.allocate(4 + body.size)
         buf.putInt(body.size)
         buf.put(body)
-        output?.write(buf.array())
-        output?.flush()
+        synchronized(this) {
+            output?.write(buf.array())
+            output?.flush()
+        }
     }
 
     override fun scanForService(serviceUuid: String): Flow<BleDeviceAdvertisement> {
@@ -121,7 +149,7 @@ class MacBluetoothManager(
     }
 
     override fun stopScan() {
-        // Not required for daemon passthrough
+        // Scanning is passive (daemon pushes results); nothing to stop explicitly
     }
 
     override suspend fun connect(macAddress: String): Result<BluetoothConnection> {
@@ -129,16 +157,15 @@ class MacBluetoothManager(
             try {
                 ensureConnected()
                 sendTcpMessage(0x04, macAddress.toByteArray(Charsets.UTF_8))
-                Result.success(MacBluetoothConnection(macAddress))
+                Result.success(MacBluetoothConnection())
             } catch (e: Exception) {
                 Result.failure(e)
             }
         }
     }
 
-    inner class MacBluetoothConnection(
-        private val macAddress: String
-    ) : BluetoothConnection {
+    inner class MacBluetoothConnection : BluetoothConnection {
+
         override suspend fun writeCharacteristic(
             serviceUuid: String,
             characteristicUuid: String,
@@ -155,21 +182,17 @@ class MacBluetoothManager(
         override suspend fun readCharacteristic(
             serviceUuid: String,
             characteristicUuid: String
-        ): Result<ByteArray> {
-            return Result.failure(UnsupportedOperationException("Read not supported"))
-        }
+        ): Result<ByteArray> = Result.failure(UnsupportedOperationException("Read not supported via daemon"))
 
         override fun subscribeToNotifications(
             serviceUuid: String,
             characteristicUuid: String
-        ): Flow<ByteArray> {
-            return _notifications.asSharedFlow()
-        }
+        ): Flow<ByteArray> = _notifications.asSharedFlow()
 
         override fun disconnect() {
             try {
                 sendTcpMessage(0x05)
-            } catch (e: Exception) {}
+            } catch (_: Exception) {}
         }
     }
 }

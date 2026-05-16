@@ -1,21 +1,10 @@
 package com.otabi.doorman.domain
 
 class SwitchBotProtocol(
-    private val keyHex: String,
-    private val keyId: Byte = 0x51
+    val keyHex: String = "00000000000000000000000000000000"
 ) {
-    fun buildToggleCommand(): ByteArray {
-        // TODO: implement real command building
-        return byteArrayOf()
-    }
-
-    fun parseStatus(mfrData: ByteArray): DoorStatus {
-        // TODO: implement real status parsing
-        return DoorStatus.Unknown
-    }
-
     fun parseNotification(data: ByteArray): DoorStatus {
-        // TODO: implement real notification parsing
-        return parseStatus(data)
+        if (data.size < 6) return DoorStatus.UNKNOWN
+        return if (data[4].toInt() and 0x01 == 0) DoorStatus.OPEN else DoorStatus.CLOSED
     }
 }

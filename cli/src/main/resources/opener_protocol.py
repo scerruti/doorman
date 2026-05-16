@@ -7,10 +7,9 @@ import struct
 WRITE_UUID  = "cba20002-224d-11e6-9fb8-0002a5d5c51b" #
 NOTIFY_UUID = "cba20003-224d-11e6-9fb8-0002a5d5c51b" #
 
-# Fixed 16‑byte command frames extracted from your Android capture
-STATUS_FRAME = bytes.fromhex("570f31000000050100020000010000e3") #
-OPEN_FRAME   = bytes.fromhex("570f31000000050102020000010000e5") #
-CLOSE_FRAME  = bytes.fromhex("570f31000000050101020000010000e4") #
+# SwitchBot Relay Switch — single toggle command (Kotlin guards against wrong-state sends)
+TOGGLE_FRAME = bytes([0x57, 0x01, 0x01]) + bytes(13)
+STATUS_FRAME = bytes([0x57, 0x02])       + bytes(14)
 
 
 # GDO State Mapping: Bridges human-readable states with the hardware's byte codes.

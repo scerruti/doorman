@@ -1,6 +1,9 @@
 package com.otabi.doorman.domain
 
-expect class BluetoothManager {
-    suspend fun scanForDevices(): List<BleDeviceAdvertisement>
-    suspend fun connect(mac: String): BluetoothConnection
+import kotlinx.coroutines.flow.Flow
+
+interface BluetoothManager {
+    fun scanForService(serviceUuid: String): Flow<BleDeviceAdvertisement>
+    fun stopScan()
+    suspend fun connect(macAddress: String): Result<BluetoothConnection>
 }

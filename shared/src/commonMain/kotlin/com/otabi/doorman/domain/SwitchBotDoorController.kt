@@ -1,65 +1,98 @@
 package com.otabi.doorman.domain
 
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
+
 class SwitchBotDoorController(
     private val bluetoothManager: BluetoothManager,
-    private val protocol: SwitchBotProtocol
+    private val macAddress: String,
+    private val protocol: SwitchBotProtocol,
+    private val scope: CoroutineScope,
+    private val travelTimeMs: Long = 15000L
 ) : DoorController {
 
-    override suspend fun openDoor(address: String?): Result<Unit> =
-        sendToggle(address)
+    private val stateTracker = DoorStateTracker(scope, travelTimeMs)
 
-    override suspend fun closeDoor(address: String?): Result<Unit> =
-        sendToggle(address)
+    override val state: StateFlow<DoorStatus> = stateTracker.syntheticState
 
-    override suspend fun getStatus(address: String?): Result<DoorStatus> {
-        val mac = address ?: return Result.failure(IllegalArgumentException("MAC address is required"))
+    private var connection: BluetoothConnection? = null
+    override val isConnected: Boolean get() = connection != null
 
-        val devices = try {
-            bluetoothManager.scanForDevices()
-        } catch (e: Exception) {
-            return Result.failure(e)
-        }
+    private val _discoveredDevices = mutableListOf<BleDeviceAdvertisement>()
+    override val discoveredDevices: List<BleDeviceAdvertisement> get() = _discoveredDevices.toList()
 
-        val target = devices.firstOrNull { it.mac.equals(mac, ignoreCase = true) }
-            ?: return Result.failure(IllegalStateException("Device with MAC $mac not found in scan"))
+    private var scanJob: Job? = null
+    private var notifyJob: Job? = null
 
-        val mfr = target.manufacturerData
-            ?: return Result.success(DoorStatus.UNKNOWN)
+    init {
+        scanJob = scope.launch {
+            bluetoothManager.scanForService(SERVICE_UUID).collect { adv ->
+                val idx = _discoveredDevices.indexOfFirst { it.macAddress == adv.macAddress }
+                if (idx >= 0) _discoveredDevices[idx] = adv else _discoveredDevices.add(adv)
 
-        return try {
-            Result.success(protocol.parseStatus(mfr))
-        } catch (e: Exception) {
-            Result.failure(e)
-        }
-    }
-
-    private suspend fun sendToggle(address: String?): Result<Unit> {
-        val mac = address ?: return Result.failure(IllegalArgumentException("MAC address is required"))
-
-        val connection = try {
-            bluetoothManager.connect(mac)
-        } catch (e: Exception) {
-            return Result.failure(e)
-        }
-
-        return try {
-            val command = protocol.buildToggleCommand()
-            connection.writeCharacteristic(SERVICE_UUID, CHARACTERISTIC_UUID, command)
-            Result.success(Unit)
-        } catch (e: Exception) {
-            Result.failure(e)
-        } finally {
-            try {
-                connection.disconnect()
-            } catch (_: Exception) {
-                // ignore disconnect errors
+                // State is broadcast continuously in advertisement: byte 6, LSB 0=CLOSED 1=OPEN
+                if (adv.macAddress.equals(macAddress, ignoreCase = true) && adv.manufacturerData.size > 6) {
+                    val status = if (adv.manufacturerData[6].toInt() and 0x01 == 1) DoorStatus.CLOSED else DoorStatus.OPEN
+                    stateTracker.updateHardwareState(status)
+                }
             }
         }
     }
 
-    private companion object {
-        // TODO: replace with the real GDO service/characteristic UUIDs
-        const val SERVICE_UUID = "0000fd3d-0000-1000-8000-00805f9b34fb"
-        const val CHARACTERISTIC_UUID = "0000fd3e-0000-1000-8000-00805f9b34fb"
+    override suspend fun connect(): Result<Unit> {
+        val result = bluetoothManager.connect(macAddress)
+        if (result.isFailure) return Result.failure(result.exceptionOrNull()!!)
+
+        connection = result.getOrThrow()
+
+        notifyJob?.cancel()
+        notifyJob = scope.launch {
+            connection!!.subscribeToNotifications(SERVICE_UUID, NOTIFY_UUID).collect { data ->
+                val status = protocol.parseNotification(data)
+                if (status != DoorStatus.UNKNOWN) stateTracker.updateHardwareState(status)
+            }
+        }
+
+        return Result.success(Unit)
+    }
+
+    override suspend fun openDoor(address: String?): Result<Unit> {
+        val conn = connection ?: return Result.failure(Exception("Not connected. Call connect() first."))
+        val current = state.value
+        if (current == DoorStatus.OPEN || current == DoorStatus.OPENING)
+            return Result.failure(Exception("Door is already $current"))
+        val result = conn.writeCharacteristic(SERVICE_UUID, WRITE_UUID, TOGGLE_COMMAND)
+        if (result.isSuccess) stateTracker.onCommandAcknowledged()
+        return result
+    }
+
+    override suspend fun closeDoor(address: String?): Result<Unit> {
+        val conn = connection ?: return Result.failure(Exception("Not connected. Call connect() first."))
+        val current = state.value
+        if (current == DoorStatus.CLOSED || current == DoorStatus.CLOSING)
+            return Result.failure(Exception("Door is already $current"))
+        val result = conn.writeCharacteristic(SERVICE_UUID, WRITE_UUID, TOGGLE_COMMAND)
+        if (result.isSuccess) stateTracker.onCommandAcknowledged()
+        return result
+    }
+
+    override suspend fun getStatus(address: String?): Result<DoorStatus> =
+        Result.success(state.value)
+
+    override fun disconnect() {
+        notifyJob?.cancel()
+        notifyJob = null
+        connection?.disconnect()
+        connection = null
+    }
+
+    companion object {
+        const val SERVICE_UUID  = "cba20d00-224d-11e6-9fb8-0002a5d5c51b"
+        const val WRITE_UUID    = "cba20002-224d-11e6-9fb8-0002a5d5c51b"
+        const val NOTIFY_UUID   = "cba20003-224d-11e6-9fb8-0002a5d5c51b"
+
+        private val TOGGLE_COMMAND = byteArrayOf(0x57, 0x01, 0x01) + ByteArray(13)
     }
 }
