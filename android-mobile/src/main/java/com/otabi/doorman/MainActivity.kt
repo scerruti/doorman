@@ -17,15 +17,14 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.otabi.doorman.platform.AndroidBluetoothManager
+import com.otabi.doorman.domain.AesCtr
 import com.otabi.doorman.domain.SwitchBotDoorController
 import com.otabi.doorman.domain.SwitchBotProtocol
 import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
 
-    // TODO: Replace with your actual SwitchBot or Simulator MAC!
-    private val targetMac = "3C:84:27:78:A3:B2"
-    private val keyHex = "00000000000000000000000000000000"
+    private val targetMac = BuildConfig.TARGET_MAC
 
     // A reactive list holding our terminal output
     private val logs = mutableStateListOf<String>()
@@ -48,13 +47,22 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Initialize our KMP shared components exactly like the Mac CLI
+        val keyHex = BuildConfig.ENCRYPTION_KEY
+            .takeIf { it.isNotBlank() }
+            ?: error("ENCRYPTION_KEY not configured")
+        val keyId = BuildConfig.KEY_ID
+            .takeIf { it.isNotBlank() }
+            ?.toByte(16)
+            ?: error("KEY_ID not configured")
+            
         bluetoothManager = AndroidBluetoothManager(this)
         protocol = SwitchBotProtocol(keyHex)
+        val cipher = AesCtr.fromHex(keyHex, keyId)
         controller = SwitchBotDoorController(
             bluetoothManager = bluetoothManager,
             macAddress = targetMac,
             protocol = protocol,
+            cipher = cipher,
             scope = lifecycleScope,
             travelTimeMs = 15000L
         )

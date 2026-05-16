@@ -9,6 +9,7 @@ class SwitchBotDoorController(
     private val bluetoothManager: BluetoothManager,
     private val macAddress: String,
     private val protocol: SwitchBotProtocol,
+    private val cipher: AesCtr,                    // add this
     private val scope: CoroutineScope,
     private val travelTimeMs: Long = 15000L
 ) : DoorController {
@@ -50,7 +51,8 @@ class SwitchBotDoorController(
         notifyJob?.cancel()
         notifyJob = scope.launch {
             connection!!.subscribeToNotifications(SERVICE_UUID, NOTIFY_UUID).collect { data ->
-                val status = protocol.parseNotification(data)
+                val decrypted = cipher.decrypt(data)        
+                val status = protocol.parseNotification(decrypted)
                 if (status != DoorStatus.UNKNOWN) stateTracker.updateHardwareState(status)
             }
         }
@@ -58,24 +60,28 @@ class SwitchBotDoorController(
         return Result.success(Unit)
     }
 
-    override suspend fun openDoor(address: String?): Result<Unit> {
-        val conn = connection ?: return Result.failure(Exception("Not connected. Call connect() first."))
+    private suspend fun sendToggle(
+        conn: BluetoothConnection,
+        blockedStates: Set<DoorStatus>,
+        blockedMessage: (DoorStatus) -> String
+    ): Result<Unit> {
         val current = state.value
-        if (current == DoorStatus.OPEN || current == DoorStatus.OPENING)
-            return Result.failure(Exception("Door is already $current"))
-        val result = conn.writeCharacteristic(SERVICE_UUID, WRITE_UUID, TOGGLE_COMMAND)
+        if (current in blockedStates)
+            return Result.failure(Exception(blockedMessage(current)))
+        val encrypted = cipher.encrypt(TOGGLE_COMMAND)
+        val result = conn.writeCharacteristic(SERVICE_UUID, WRITE_UUID, encrypted)
         if (result.isSuccess) stateTracker.onCommandAcknowledged()
         return result
     }
 
+    override suspend fun openDoor(address: String?): Result<Unit> {
+        val conn = connection ?: return Result.failure(Exception("Not connected. Call connect() first."))
+        return sendToggle(conn, setOf(DoorStatus.OPEN, DoorStatus.OPENING)) { "Door is already $it" }
+    }
+
     override suspend fun closeDoor(address: String?): Result<Unit> {
         val conn = connection ?: return Result.failure(Exception("Not connected. Call connect() first."))
-        val current = state.value
-        if (current == DoorStatus.CLOSED || current == DoorStatus.CLOSING)
-            return Result.failure(Exception("Door is already $current"))
-        val result = conn.writeCharacteristic(SERVICE_UUID, WRITE_UUID, TOGGLE_COMMAND)
-        if (result.isSuccess) stateTracker.onCommandAcknowledged()
-        return result
+        return sendToggle(conn, setOf(DoorStatus.CLOSED, DoorStatus.CLOSING)) { "Door is already $it" }
     }
 
     override suspend fun getStatus(address: String?): Result<DoorStatus> =
@@ -93,6 +99,6 @@ class SwitchBotDoorController(
         const val WRITE_UUID    = "cba20002-224d-11e6-9fb8-0002a5d5c51b"
         const val NOTIFY_UUID   = "cba20003-224d-11e6-9fb8-0002a5d5c51b"
 
-        private val TOGGLE_COMMAND = byteArrayOf(0x57, 0x01, 0x01) + ByteArray(13)
+        private val TOGGLE_COMMAND = byteArrayOf(0x57, 0x01, 0x01)
     }
 }

@@ -20,6 +20,8 @@ import argparse
 import logging
 import os
 import configparser
+from Crypto.Cipher import AES
+from Crypto.Util import Counter
 from bleak import BleakScanner, BleakClient
 from simulated_door import SimulatedDoor
 import opener_protocol
@@ -45,8 +47,14 @@ def load_creds(file_path):
     with open(file_path, 'r') as f:
         config.read_string('[DEFAULT]\n' + f.read())
     try:
-        mac = config.get('DEFAULT', 'switchbot.mac.address', fallback='AA:BB:CC:DD:EE:FF').strip()
-        return {'mac': mac or 'AA:BB:CC:DD:EE:FF'}
+        mac     = config.get('DEFAULT', 'switchbot.mac.address',           fallback='AA:BB:CC:DD:EE:FF').strip()
+        key_hex = config.get('DEFAULT', 'switchbot.device.encryption.key', fallback='').strip()
+        key_id  = config.get('DEFAULT', 'switchbot.device.key.id',         fallback='').strip()
+        return {
+            'mac':     mac or 'AA:BB:CC:DD:EE:FF',
+            'key_hex': key_hex,
+            'key_id':  int(key_id, 16) if key_id else 0,
+        }
     except Exception as e:
         logger.error(f"Error parsing {file_path}: {e}")
         return None
@@ -64,7 +72,10 @@ class DumbDaemon:
         self.mac_mapping = {}
 
         creds = load_creds('device-secrets.properties')
-        sim_mac = creds['mac'] if creds else 'AA:BB:CC:DD:EE:FF'
+        sim_mac     = creds['mac']     if creds else 'AA:BB:CC:DD:EE:FF'
+        key_hex     = creds['key_hex'] if creds else ''
+        self._key    = bytes.fromhex(key_hex) if key_hex else None
+        self._key_id = creds['key_id'] if creds else 0
 
         if sim_mode:
             self.sim_door = SimulatedDoor(
@@ -138,6 +149,22 @@ class DumbDaemon:
             self.clients.discard(writer)
             writer.close()
 
+    def _decrypt(self, data: bytes) -> bytes:
+        """AES-CTR decrypt matching AesCtr.kt: first byte is the IV byte, rest is ciphertext."""
+        if self._key is None or len(data) < 2:
+            return data
+        iv = bytes([data[0]]) + bytes(15)
+        ctr = Counter.new(128, initial_value=int.from_bytes(iv, 'big'))
+        return AES.new(self._key, AES.MODE_CTR, counter=ctr).decrypt(data[1:])
+
+    def _encrypt(self, data: bytes) -> bytes:
+        """AES-CTR encrypt matching AesCtr.kt: prepend keyId byte as IV, then ciphertext."""
+        if self._key is None:
+            return data
+        iv = bytes([self._key_id]) + bytes(15)
+        ctr = Counter.new(128, initial_value=int.from_bytes(iv, 'big'))
+        return bytes([self._key_id]) + AES.new(self._key, AES.MODE_CTR, counter=ctr).encrypt(data)
+
     # -------------------------------------------------------------------------
     # Real BLE — scanner callback (with macOS UUID → real MAC substitution)
     # -------------------------------------------------------------------------
@@ -160,7 +187,8 @@ class DumbDaemon:
             if mfr_id == 0x0969 and len(mfr_bytes) >= 6:
                 real_mac = ':'.join(f'{b:02X}' for b in mfr_bytes[:6])
                 reported_mac = real_mac
-                logger.info(f"GDO: {device.name} uuid={device.address} → mac={real_mac} RSSI={advertisement_data.rssi}")
+                if reported_mac not in self.mac_mapping:
+                    logger.info(f"GDO: {device.name} uuid={device.address} → mac={real_mac} RSSI={advertisement_data.rssi}")
 
             # Keep reverse mapping so handle_connect can pass the UUID back to Bleak
             self.mac_mapping[reported_mac] = device.address
@@ -205,11 +233,13 @@ class DumbDaemon:
 
     async def handle_write(self, data):
         if self.sim_mode:
-            logger.info(f"[SIM] Write {data.hex()}")
-            self.sim_door.write(data)
+            plaintext = self._decrypt(data)
+            logger.info(f"[SIM] Write encrypted={data.hex()} plain={plaintext.hex()}")
+            self.sim_door.write(plaintext)
             for payload in self.sim_door.get_pending_notifications():
-                logger.info(f"[SIM] Notification → {payload.hex()}")
-                self.broadcast_tcp(bytes([MSG_TYPE_NOTIFY]) + payload)
+                encrypted = self._encrypt(payload)
+                logger.info(f"[SIM] Notification plain={payload.hex()} encrypted={encrypted.hex()}")
+                self.broadcast_tcp(bytes([MSG_TYPE_NOTIFY]) + encrypted)
             return
 
         if self.active_client and self.active_client.is_connected:
@@ -247,8 +277,9 @@ class DumbDaemon:
         while True:
             self.sim_door.tick(time.time())
             for payload in self.sim_door.get_pending_notifications():
-                logger.info(f"[SIM] Heartbeat notify → {payload.hex()}")
-                self.broadcast_tcp(bytes([MSG_TYPE_NOTIFY]) + payload)
+                encrypted = self._encrypt(payload)
+                logger.info(f"[SIM] Heartbeat notify plain={payload.hex()} encrypted={encrypted.hex()}")
+                self.broadcast_tcp(bytes([MSG_TYPE_NOTIFY]) + encrypted)
             await asyncio.sleep(0.5)
 
     # -------------------------------------------------------------------------

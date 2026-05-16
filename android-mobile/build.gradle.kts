@@ -1,6 +1,13 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     kotlin("android")
+}
+
+val secrets = Properties().also { props ->
+    val f = rootProject.file("device-secrets.properties")
+    if (f.exists()) props.load(f.inputStream())
 }
 
 android {
@@ -12,6 +19,10 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"
+
+        buildConfigField("String", "TARGET_MAC",     "\"${secrets["switchbot.mac.address"]          ?: ""}\"")
+        buildConfigField("String", "ENCRYPTION_KEY", "\"${secrets["switchbot.device.encryption.key"] ?: ""}\"")
+        buildConfigField("String", "KEY_ID",         "\"${secrets["switchbot.device.key.id"]         ?: ""}\"")
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -22,6 +33,7 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true
     }
     composeOptions {
         kotlinCompilerExtensionVersion = "1.5.8"

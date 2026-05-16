@@ -9,13 +9,20 @@ import java.io.File
 
 suspend fun main(): Unit = coroutineScope {
     val gdoMac = loadProperty("switchbot.mac.address")
-    val keyHex = loadProperty("switchbot.device.encryption.key").takeIf { it.isNotBlank() } ?: "00000000000000000000000000000000"
-    
+    val keyHex = loadProperty("switchbot.device.encryption.key")
+        .takeIf { it.isNotBlank() }
+        ?: error("switchbot.device.encryption.key is not configured")
+    val keyId = loadProperty("switchbot.device.key.id")
+        .takeIf { it.isNotBlank() }
+        ?.toByte(16)
+        ?: error("switchbot.device.key.id is not configured")
+
     val bluetoothManager = MacBluetoothManager()
     val protocol = SwitchBotProtocol(keyHex)
+    val cipher = AesCtr.fromHex(keyHex, keyId)
 
     // For faster UI testing you can drop the travelTimeMs to 5000L
-    val controller = SwitchBotDoorController(bluetoothManager, gdoMac, protocol, this, travelTimeMs = 15000L)
+    val controller = SwitchBotDoorController(bluetoothManager, gdoMac, protocol, cipher, this, travelTimeMs = 15000L)    
 
     println("=== Doorman Garage Door Controller ===")
     println("Loaded configuration:")
