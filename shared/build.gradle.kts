@@ -29,3 +29,7 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 }
+
+dependencies {
+    implementation("com.otabi.switchbot:lib-switchbot:1.0-SNAPSHOT")
+}

@@ -3,6 +3,7 @@ pluginManagement {
         google()
         mavenCentral()
         gradlePluginPortal()
+        mavenLocal() // Tells Gradle to look on your Mac's "local shelf" for plugins
     }
 }
 dependencyResolutionManagement {
@@ -10,6 +11,7 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        mavenLocal() // Tells Gradle to look on your Mac's "local shelf" for plugins
     }
 }
 rootProject.name = "doorman"
