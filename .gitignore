@@ -2,6 +2,7 @@
 # Project-specific
 # =============================================================================
 scripts/door_test.py
+scripts/switchbot_test.py
 src/main/resources/sim_devices.json
 src/main/resources/real_devices.json
 
