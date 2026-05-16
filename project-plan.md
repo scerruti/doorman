@@ -168,7 +168,7 @@ macApp/src/main/
 
 ### Phase 3: Integration & Testing
 1. Integrate real SwitchBot Bluetooth implementation
-2. Refine BLE connection stability
+2. Add security features (encrypted commands)
 3. Comprehensive testing across platforms
 4. Performance optimization
 5. Documentation and deployment
@@ -234,8 +234,8 @@ macApp/src/main/
 
 ## Security Considerations
 
-- Direct Bluetooth communication
-- Secure storage of device MAC addresses
+- Encrypted Bluetooth communication
+- Secure storage of device passwords
 - Input validation and sanitization
 - Regular dependency updates
 

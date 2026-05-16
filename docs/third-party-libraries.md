@@ -42,13 +42,14 @@ This document recommends libraries for SwitchBot and Bluetooth support in the Do
 - Treat SwitchBot as a protocol layer on top of BLE
 - Implement a small library/module that handles:
   - BLE device discovery by MAC address or device name
+  - Password-authenticated command generation
   - Payload formatting for SwitchBot open/close commands
   - Response validation and retry logic
 
 ### Library Options
 
 - **No official Kotlin library** is currently recommended for this exact workflow.
-- Use a custom wrapper to format direct BLE commands.
+- Use a custom wrapper if you need secure password support and direct BLE commands.
 - For reference, the SwitchBot protocol is well documented by the community and can be implemented in a small, focused module.
 
 ## Integration Strategy

@@ -21,7 +21,7 @@ Implement local SwitchBot Bluetooth support first, then extend to SwitchBot clou
    - Implement BLE scanning, connect, and GATT write/read operations
 
 4. **SwitchBot local protocol**
-   - Implement accurate payload formatting for the GDO
+   - Implement password-authenticated payload formatting
    - Create a `SwitchBotCommandBuilder` module
    - Add device response validation and retry behavior
 
@@ -48,7 +48,7 @@ Implement local SwitchBot Bluetooth support first, then extend to SwitchBot clou
 - Build the `GarageDoor` interface and mock implementation
 - Create a macOS test harness for BLE
 - Validate BLE scanning for the SwitchBot device
-- Implement local open/close commands
+- Implement local password-authenticated open/close commands
 
 ### Phase 2 — Android Shell and Core Flow
 

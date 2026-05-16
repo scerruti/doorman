@@ -36,8 +36,9 @@ The repository uses a modular project layout with a dedicated documentation tree
 
 ### Security
 
-- The application communicates directly via BLE to the target MAC address
-- Security paradigms depend on the specific hardware generation (newer GDO devices handle pairing and encryption differently than legacy Bot devices)
+- Require SwitchBot device password mode for secure local BLE control
+- Use timestamped authentication tokens when operating over Bluetooth
+- Avoid unencrypted replay-prone payloads in production
 
 ## Future Cloud/API Support
 

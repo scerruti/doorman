@@ -1,14 +1,14 @@
-# Test Plan: SwitchBot GDO BLE Garage Door Controller
+# Test Plan: SwitchBot BLE Garage Door Controller
 
 ## Current Status
 ✅ **BLE Layer Implemented**: Kotlin JVM app successfully calls Python bleak for BLE operations  
 ✅ **Discovery Working**: Scans for BLE devices and filters for SwitchBot devices  
-✅ **Command Protocol**: Sends correct SwitchBot GDO commands  
+✅ **Command Protocol**: Sends correct SwitchBot Bot toggle commands (0x57 0x01)  
 ✅ **Error Handling**: Gracefully handles missing devices and connection failures  
 ✅ **Testing Ready**: App runs cleanly and is ready for hardware testing with real SwitchBot device
 
 ## Prerequisites
-- **Hardware**: SwitchBot GDO device, paired with your Mac (via System Settings > Bluetooth)
+- **Hardware**: SwitchBot Bot device, paired with your Mac (via System Settings > Bluetooth)
 - **Software**:
   - JDK 17+ installed
   - Python 3 installed (`python3 --version`)
@@ -31,7 +31,7 @@
 1. Run `./gradlew run`
 2. Observe console output for "Scanning for BLE devices..."
 3. Wait 5-10 seconds for scan completion
-4. Check output for "Found device: WoSwitchGDO (XX:XX:XX:XX:XX:XX)"
+4. Check output for "Found device: SwitchBot Bot (XX:XX:XX:XX:XX:XX)"
 
 **Expected Result**:
 - Device discovery succeeds
@@ -50,12 +50,12 @@
 2. Run `./gradlew run`
 3. Observe "Connecting to [device address]..."
 4. Watch for "Command sent" confirmation
-5. Physically check if garage door opens
+5. Physically check if garage door opens (or SwitchBot moves)
 
 **Expected Result**:
 - BLE connection succeeds
 - Command transmission completes without errors
-- SwitchBot GDO device activates
+- SwitchBot device activates (physical movement/beep)
 
 **Pass/Fail Criteria**:
 - PASS: Command sent successfully, device responds
@@ -70,7 +70,7 @@
 
 **Expected Result**:
 - Second command succeeds
-- Door closes
+- Door closes (or SwitchBot toggles back)
 
 **Pass/Fail Criteria**:
 - PASS: Toggle works in both directions
@@ -140,7 +140,7 @@ Door close command sent successfully
 Status: UNKNOWN
 ```
 
-**Note**: Unlike basic stateless toggles, a GDO may support status updates. Adjust expectations accordingly based on simulated vs real hardware. Physical device movement indicates success.
+**Note**: SwitchBot Bot devices are stateless toggles, so status always shows UNKNOWN. Physical device movement indicates success.
 
 ## Troubleshooting
 - **No devices found**: Check BLE permissions, device power, range

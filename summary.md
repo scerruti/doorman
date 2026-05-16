@@ -1,7 +1,7 @@
 Project: AAOS Smart Garage Door Controller
 
 Target Platform: Android (Mobile) & Android Automotive OS (Equinox EV)
-Core Hardware: SwitchBot Garage Door Opener (GDO)
+Core Hardware: SwitchBot Bot (Physical button pusher)
 
 1. Project Vision & Use Cases
 
@@ -21,7 +21,7 @@ Once the UI is finalized, the mock controller can be swapped out for one of two 
 
 HttpSwitchBotDoor: Uses the SwitchBot Cloud API over the internet.
 
-BluetoothSwitchBotDoor: Uses direct Bluetooth Low Energy (BLE) to communicate locally with the GDO.
+BluetoothSwitchBotDoor: Uses direct Bluetooth Low Energy (BLE) to communicate locally with the Bot.
 
 3. The Connectivity Dilemma: Cloud vs. Edge
 
@@ -37,3 +37,29 @@ Geofence Breached: Notification appears reading "Approaching Home..." with a dis
 BLE Discovery: Once the phone's radio detects the SwitchBot, the background service updates the existing notification.
 
 Ready State: The notification text changes to "Garage in Range" and the button becomes active, reading "Open Door."
+
+4. The Critical Security Vulnerability
+
+During the design phase, a major security flaw in the default hardware configuration was identified.
+
+Out of the box, a SwitchBot operates with no local authentication. It listens constantly for a static, unencrypted byte payload (0x57, 0x01, 0x00).
+
+The Replay Attack Risk
+
+Because the command is static, anyone with a free Bluetooth scanning app on their phone can walk past the garage, broadcast that exact string of bytes, and trigger the mechanical arm. The Bot has no way of verifying who is sending the command.
+
+Cloud Security vs. Local Security
+
+A common misconception is that adding a Google Assistant Voice PIN secures the device.
+
+Voice PIN (Cloud): Only protects the internet-based pathway. It stops someone from standing outside a window and yelling, "Hey Google, open the garage."
+
+Device Password (Local): Protects the physical Bluetooth radio.
+
+The Bot's Bluetooth receiver remains active 24/7. Even if the device is exclusively controlled via the internet or Google Home, the local, unsecured Bluetooth pathway remains wide open.
+
+The Required Mitigation
+
+To secure the home, the Password feature must be manually enabled within the specific device settings in the SwitchBot mobile app.
+
+Enabling this changes the communication protocol. The static three-byte payload is rejected. Instead, the controlling app (our custom Kotlin app) must generate a dynamic, one-time authentication token. This token is created by running the user's PIN, the Bot's MAC address, and the current timestamp through a cryptographic hash function. Because the timestamp changes constantly, a recorded command cannot be replayed by a bad actor later, effectively securing the local perimeter.
